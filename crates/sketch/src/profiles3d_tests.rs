@@ -325,6 +325,26 @@ fn a_loop_after_a_long_open_wire_still_spans_its_plane() {
 }
 
 #[test]
+fn a_loop_in_a_plane_almost_like_an_earlier_one_is_still_found() {
+    // An open wire first spans the plane z = 30 + 0.00001·x, tilted 0.00001 rad from the
+    // triangle's plane z = 30. Near x = 0 the two planes agree, but at the triangle (x = 100 to
+    // 110) they are 0.001 mm apart, far more than the tolerance. The tilted plane must not
+    // stand in for the triangle's own, or the triangle lies off it and is lost.
+    let mut sk = Sketch::new();
+    sk.view.three_d = true;
+    let tilted = |x: f64, y: f64| Vec3 { x, y, z: 30.0 + 1e-5 * x };
+    sk.wires.push(wire("lean", &[tilted(0.0, 0.0), tilted(10.0, 0.0), tilted(0.0, 10.0)]));
+    let a = Vec3 { x: 100.0, y: 0.0, z: 30.0 };
+    sk.wires.push(wire("tri", &[a, Vec3 { x: 110.0, y: 0.0, z: 30.0 }, Vec3 { x: 105.0, y: 8.0, z: 30.0 }, a]));
+    let ps = find_planar_3d_profiles(&sk, Plane::XY);
+    assert!(
+        ps.iter().any(|p| p.outer_curves == ["tri"] && (p.area - 40.0).abs() < 1e-6),
+        "the triangle (area 40): {:?}",
+        ps.iter().map(|p| (&p.outer_curves, p.area)).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn nothing_without_3d_wires() {
     let mut sk = Sketch::new();
     let a = sk.add_point(Vec2 { x: 0.0, y: 0.0 }, None).unwrap();

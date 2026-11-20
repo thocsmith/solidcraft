@@ -50,6 +50,9 @@ const KEY_SAMPLES: usize = 5;
 const MAX_EDGES: usize = 2_000;
 /// Distinct planes considered.
 const MAX_PLANES: usize = 256;
+/// Two candidate planes no farther apart than this (mm) at any node are one plane: well inside
+/// `MERGE_TOL`, so both hold the same edges.
+const SAME_PLANE: f64 = MERGE_TOL / 100.0;
 /// A face smaller than this (mm²) is round-off, not a profile.
 const MIN_AREA: f64 = 1e-9;
 
@@ -184,6 +187,8 @@ pub fn find_planar_3d_profiles(sk: &Sketch, plane: Plane) -> Vec<Profile3D> {
     // candidate too (flat 3D loops take part there); profiles bounded only by in-plane curves are
     // dropped below, so nothing is listed twice.
     let mut candidates: Vec<Candidate> = Vec::new();
+    // How far the nodes reach from the origin, so two planes can be compared at all of them.
+    let reach = nodes.pts.iter().filter(|p| p.is_finite()).map(|p| p.len()).fold(0.0_f64, f64::max);
     'sets: for set in [&key, &all] {
         for i in 0..set.len() {
             for j in i + 1..set.len() {
@@ -196,7 +201,9 @@ pub fn find_planar_3d_profiles(sk: &Sketch, plane: Plane) -> Vec<Profile3D> {
                         continue;
                     }
                     let (n, off) = canonical(n / len, n.dot(a) / len);
-                    let known = candidates.iter().any(|p| (p.n.dot(n) - 1.0).abs() < 1e-9 && (p.off - off).abs() < 1e-6);
+                    // The same plane only if the two agree at every node, far ones too: two
+                    // planes a hair apart in angle can hold different edges far from the origin.
+                    let known = candidates.iter().any(|p| (p.n - n).len() * reach + (p.off - off).abs() <= SAME_PLANE);
                     if known {
                         continue;
                     }
