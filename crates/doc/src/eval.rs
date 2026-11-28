@@ -5778,6 +5778,20 @@ fn placement_digest(doc: &Document, f: &Feature, st: Option<&ModelState>) -> u64
                 reads.placed_body(st, b);
             }
         }
+        // Split Face by 3D curves moves the curves (from their sketch's frame) and its direction
+        // (from its own) into the frame the target body is stored in, its offset included: moving
+        // the body, or the sketch's component, relative to this feature splits it again. Without
+        // a named body it splits the one nearest its faces, so every body's placement is read.
+        FeatureKind::SplitFace { body, tool: None, sketch: Some(sid), wires, .. }
+            if !wires.is_empty() || st.is_none_or(|st| sketch_splits_with_wires(st, sid.0)) =>
+        {
+            match (st, body) {
+                (_, Some(name)) => reads.placed_body(st, name),
+                (Some(st), None) => reads.bodies.extend(st.bodies.iter().map(|b| b.name.clone())),
+                (None, None) => reads.all = true,
+            }
+            read_mapped_sketch(&mut reads, sid.0);
+        }
         FeatureKind::FrameCope { member, tools, .. } => {
             reads.placed_body(st, member);
             for tool in tools {

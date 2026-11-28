@@ -402,3 +402,46 @@ fn split_face_by_a_3d_line_on_a_placed_body() {
     // Sides 600, 600, 800, 800, bottom 1200, and the top's two pieces.
     assert!(close(a[0], 300.0) && close(a[5], 900.0), "{a:?}");
 }
+
+/// The areas of body `b`'s faces, smallest first.
+fn body_faces(s: &mut Session, b: &str) -> Vec<f64> {
+    let f = run(s, "model.faces", json!({"body": b}));
+    let mut a: Vec<f64> = f["faces"].as_array().cloned().unwrap_or_default().iter().map(|x| x["area"].as_f64().unwrap_or(f64::NAN)).collect();
+    a.sort_by(f64::total_cmp);
+    a
+}
+
+/// A 3D line at world x = 10 splits the 40 × 30 top into 300 and 900 mm². Moving only the body
+/// 2 mm along +X puts the line at x = 8 in the body's own frame: the split is built again there,
+/// 8 · 30 = 240 and 32 · 30 = 960 mm², not reused at x = 10 (which would now show at x = 12).
+/// Moving another body, or setting the same offset again, leaves the split as it was.
+#[test]
+fn split_face_by_a_3d_line_follows_its_body_offset() {
+    use solidcore_record::Vec3;
+    let mut s = boxed();
+    run(&mut s, "solid.box", json!({"corner": [100, 0, 0], "length": 10, "width": 10, "height": 10, "body_name": "Other"}));
+    run(&mut s, "sketch.create", json!({"plane": "XY", "name": "Marks"}));
+    run(&mut s, "sketch.options", json!({"sketch_3d": true}));
+    run(&mut s, "sketch.line3d", json!({"points": [[10, 5, 20], [10, 25, 20]]}));
+    run(&mut s, "sketch.finish", json!({}));
+    run(&mut s, "solid.split_face", json!({"faces": [[20, 15, 20]], "body": "B", "sketch": "Marks"}));
+    let a = body_faces(&mut s, "B");
+    assert!(close(a[0], 300.0) && close(a[5], 900.0), "{a:?}");
+
+    let offset = solidcraft_doc::rigid(Vec3::new(2.0, 0.0, 0.0), Vec3::ZERO, Vec3::Z, 0.0);
+    s.doc_mut().body_offsets.insert("B".into(), offset);
+    s.refresh();
+    assert!(s.model.last_recomputed >= 1, "the split is built again");
+    assert!(s.model.results.iter().all(|r| r.error.is_none()), "{:?}", s.model.results);
+    let a = body_faces(&mut s, "B");
+    assert_eq!(a.len(), 7, "{a:?}");
+    assert!(close(a[0], 240.0) && close(a[5], 960.0), "{a:?}");
+
+    // The same placement: nothing is built again.
+    s.doc_mut().body_offsets.insert("B".into(), offset);
+    s.doc_mut().body_offsets.insert("Other".into(), solidcraft_doc::rigid(Vec3::new(0.0, 50.0, 0.0), Vec3::ZERO, Vec3::Z, 0.0));
+    s.refresh();
+    assert_eq!(s.model.last_recomputed, 0, "an unchanged placement of B reuses the split");
+    let a = body_faces(&mut s, "B");
+    assert!(close(a[0], 240.0) && close(a[5], 960.0), "{a:?}");
+}
