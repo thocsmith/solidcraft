@@ -284,6 +284,17 @@ fn an_edge_with_a_notch_at_its_middle_offsets_either_side_of_it() {
     assert!((total - 990.0).abs() < 1e-2, "{total}");
 }
 
+/// The recovery probes of a partly leaving offset end on the range's own ends: over [-0.1, 0.2]
+/// `a + (b - a) * 32 / 32` is 0.20000000000000004, past a spline's interval.
+#[test]
+fn the_last_recovery_probe_is_the_ranges_own_end() {
+    use crate::offset_curve::probe;
+    assert_eq!(-0.1 + (0.2 - -0.1) * 32.0 / 32.0, 0.200_000_000_000_000_04);
+    assert_eq!(probe([-0.1, 0.2], 0), -0.1);
+    assert_eq!(probe([-0.1, 0.2], 32), 0.2);
+    assert_eq!(probe([0.0, 1.0], 16), 0.5);
+}
+
 #[test]
 fn offset_curve_refusals() {
     let body = plane_strip();

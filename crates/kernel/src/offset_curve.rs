@@ -152,7 +152,7 @@ fn staying_runs(s: &Source, sheet: &brep::Brep, distance: f64) -> Result<Vec<[f6
             Err(e) => Err(refused(e)),
         }
     };
-    let at = |k: usize| a + (b - a) * k as f64 / PROBES as f64;
+    let at = |k: usize| probe(s.range, k);
     let mut valid = Vec::with_capacity(PROBES + 1);
     for k in 0..=PROBES {
         valid.push(stays(at(k))?);
@@ -185,6 +185,13 @@ fn staying_runs(s: &Source, sheet: &brep::Brep, distance: f64) -> Result<Vec<[f6
         k += 1;
     }
     Ok(runs)
+}
+
+/// The `k`th of the [`PROBES`] + 1 probes over `range`, its ends exactly the range's own (in
+/// floating point `a + (b - a)` need not be `b`: over [-0.1, 0.2] it is 0.20000000000000004,
+/// past the curve's interval).
+pub(crate) fn probe([a, b]: [f64; 2], k: usize) -> f64 {
+    if k >= PROBES { b } else { a + (b - a) * k as f64 / PROBES as f64 }
 }
 
 fn refused(e: solidcore_ops::Error) -> KernelError {

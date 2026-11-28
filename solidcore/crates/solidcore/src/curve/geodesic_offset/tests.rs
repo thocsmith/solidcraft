@@ -286,6 +286,79 @@ fn a_geodesic_from_the_seam_reads_the_spans_across_it() {
     }
 }
 
+/// A knot's periodic copies are taken from `x0` on in the direction of travel: from 0 toward
+/// −16 with a knot at 0 every 1, the first crossing is −1, a sixteenth of the way (the copy at 0
+/// lies in the sliver at `x0`), not a copy eight seams on.
+#[test]
+fn a_periodic_knot_is_met_first_in_the_direction_of_travel() {
+    assert_eq!(
+        knot_on_way(0.0, -16.0, 1.0, &[0.0], 1.0).unwrap(),
+        Some((0.0625, -1.0))
+    );
+    assert_eq!(
+        knot_on_way(0.0, 16.0, 1.0, &[0.0], 1.0).unwrap(),
+        Some((0.0625, 1.0))
+    );
+    // the next copy, at 1, lies past the way's end at 0.5
+    assert_eq!(knot_on_way(0.25, 0.5, 1.0, &[0.0], 1.0).unwrap(), None);
+    // not periodic: the knot itself, a quarter of the way
+    assert_eq!(
+        knot_on_way(0.0, -16.0, 1.0, &[-4.0], 0.0).unwrap(),
+        Some((0.25, -4.0))
+    );
+}
+
+/// A way more than 2^20 periods from a knot is refused, not looped over: at 2^53 periods and
+/// past them `m + 1.0` is `m`, so the old lookup never ended.
+#[test]
+fn a_knot_lookup_past_2_to_the_20_turns_is_refused_and_ends() {
+    for x1 in [-1e17, 1e17, -9_007_199_254_740_992.0, f64::MAX] {
+        let r = knot_on_way(0.0, x1, 1.0, &[0.0], 1.0);
+        assert!(
+            matches!(r, Err(SolidError::InvalidInput { .. })),
+            "{x1}: {r:?}"
+        );
+    }
+    // 2^20 periods on: still found, the first copy at −1 (2^−20 of the way)
+    assert_eq!(
+        knot_on_way(0.0, -1_048_576.0, 1.0, &[0.0], 1.0).unwrap(),
+        Some((1.0 / 1_048_576.0, -1.0))
+    );
+}
+
+/// A line up a cylinder of radius 5 offsets round it (by 2: the line 0.4 rad round); offset by
+/// 1e20 its Runge-Kutta stages run some 1e17 turns round, and the offset is refused rather than
+/// never returning.
+#[test]
+fn an_offset_winding_too_often_round_a_cylinder_is_refused() {
+    let mut k = Kernel::default();
+    let b = create_cylinder(&mut k, Point3::ZERO, 5.0, 10.0).unwrap();
+    let (s, dom) = face_of(&b, |s, d| {
+        s.drop_point::<NoObject>(
+            &k,
+            Vec3::new(5.0, 0.0, 5.0),
+            d,
+            &DropPointOptions::default(),
+        )
+        .is_ok_and(|f| f.success && f.gap <= 1e-9)
+    });
+    let up = through(5, |t| Vec3::new(0.0, 5.0, 2.0 + 6.0 * t));
+    let ivl = up.natural_interval();
+    let o = geodesic_offset(&k, &s, &dom, &up, &ivl, 2.0, Side::Left, 1e-5).unwrap();
+    for p in along(&k, &o.curve) {
+        let turn = (p.y.atan2(p.x) - std::f64::consts::FRAC_PI_2).abs();
+        assert!(
+            (p.x.hypot(p.y) - 5.0).abs() <= 1e-5 && (turn - 0.4).abs() <= 1e-5,
+            "{p:?}"
+        );
+    }
+    let e = geodesic_offset(&k, &s, &dom, &up, &ivl, 1e20, Side::Left, 1e-5).unwrap_err();
+    assert!(
+        e.to_string().contains("winding more than 2^20 times"),
+        "{e}"
+    );
+}
+
 #[test]
 fn an_offset_off_the_surface_and_bad_inputs_are_refused() {
     let mut k = Kernel::default();

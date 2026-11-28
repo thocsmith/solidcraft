@@ -20,7 +20,8 @@
 //!   step count doubles from 16 until two
 //!   successive end points lie within a tenth of the tolerance of each other (at most
 //!   [`MAX_STEPS`]). A geodesic crosses a periodic surface's seam; one leaving the surface's
-//!   parameter box elsewhere is refused.
+//!   parameter box elsewhere is refused, and so is one whose steps run more than 2^20 times
+//!   round a periodic surface (past that a knot line's copy is not resolved).
 //! - Where neighbouring ends run back against the curve's direction carried along the
 //!   geodesics to them (the offset's own direction there), the offset folds over itself and is
 //!   refused.
@@ -98,7 +99,8 @@ pub struct GeodesicOffset {
 /// `InvalidInput` for a distance or a tolerance not finite and positive, a station whose foot is
 /// not found or where the surface is singular, a curve with no tangent at a station, a
 /// geodesic leaving the surface's parameter box, or ends that run back against the curve (the
-/// distance past its radius of curvature on the surface, where the offset folds over itself); `NotConverged` when a geodesic's end does not
+/// distance past its radius of curvature on the surface, where the offset folds over itself), or
+/// a geodesic winding more than 2^20 times round a periodic surface; `NotConverged` when a geodesic's end does not
 /// settle within [`MAX_STEPS`] steps; those of the evaluations, the drops and the fit.
 pub fn geodesic_offset(
     k: &Kernel,
@@ -210,34 +212,68 @@ pub fn geodesic_offset(
     }
 }
 
+/// The most whole periods a periodic parameter's way may lie from a knot (2^20): past it a
+/// knot's copy `kn + m * period` is no longer resolved well (and at 2^53 periods `m + 1` is `m`),
+/// so the lookup refuses the way rather than cut on the wrong copy.
+const MAX_TURNS: f64 = 1_048_576.0;
+
+/// The copies of one knot looked at from `x0` on, the one at or behind `x0` included: the first
+/// past the sliver at `x0` is the knot's first crossing.
+const KNOT_COPIES: u32 = 4;
+
 /// The fraction of the way from `x0` to `x1` (up to `reach` times the way, past a sliver at
 /// `x0`) where the first of `knots` lies, and its value there: on a periodic parameter
-/// (`period` more than 0) the knots' copies a whole period on count too.
-fn knot_on_way(x0: f64, x1: f64, reach: f64, knots: &[f64], period: f64) -> Option<(f64, f64)> {
+/// (`period` more than 0) the knots' copies a whole period on count too, each knot's copies
+/// taken from `x0` on in the direction of travel.
+///
+/// # Errors
+/// `InvalidInput` on a periodic parameter whose way lies more than [`MAX_TURNS`] periods from a
+/// knot (a geodesic winding that often round the surface).
+fn knot_on_way(
+    x0: f64,
+    x1: f64,
+    reach: f64,
+    knots: &[f64],
+    period: f64,
+) -> Result<Option<(f64, f64)>> {
     let dx = x1 - x0;
     if dx == 0.0 || !dx.is_finite() {
-        return None;
+        return Ok(None);
     }
     let far = x0 + reach * dx;
-    let (lo, hi) = (x0.min(far), x0.max(far));
     let mut best: Option<(f64, f64)> = None;
+    let mut take = |at: f64| {
+        let f = (at - x0) / dx;
+        if f > CUT_MARGIN && f <= reach && best.is_none_or(|(b, _)| f < b) {
+            best = Some((f, at));
+        }
+        f > CUT_MARGIN
+    };
     for &kn in knots {
-        let (first, last) = if period > 0.0 {
-            (((lo - kn) / period).floor(), ((hi - kn) / period).ceil())
-        } else {
-            (0.0, 0.0)
-        };
-        let mut m = first;
-        while m <= last && m - first < 8.0 {
-            let at = kn + m * period;
-            let f = (at - x0) / dx;
-            if f > CUT_MARGIN && f <= reach && best.is_none_or(|(b, _)| f < b) {
-                best = Some((f, at));
+        if period > 0.0 {
+            let (from, to) = ((x0 - kn) / period, (far - kn) / period);
+            #[allow(clippy::neg_cmp_op_on_partial_ord)] // refuses NaN too
+            if !(from.abs() <= MAX_TURNS && to.abs() <= MAX_TURNS) {
+                return Err(invalid(
+                    "a geodesic winding more than 2^20 times round a periodic surface: the distance is too long for the surface's period",
+                ));
             }
-            m += 1.0;
+            // the copy at or behind x0, then on toward x1
+            let (start, step) = if dx > 0.0 {
+                (from.floor(), 1.0)
+            } else {
+                (from.ceil(), -1.0)
+            };
+            for i in 0..KNOT_COPIES {
+                if take(kn + (start + step * f64::from(i)) * period) {
+                    break;
+                }
+            }
+        } else {
+            take(kn);
         }
     }
-    best
+    Ok(best)
 }
 
 /// One offset's geodesics: what each shot needs.
@@ -354,11 +390,12 @@ impl Shoot<'_> {
     /// rounded past a knot line from `from` is read on the line, on `from`'s side.
     fn rate(&self, s: [f64; 4], from: [f64; 4]) -> Result<[f64; 4]> {
         let [u, v, a, b] = s;
-        let read = |x: f64, x0: f64, velocity: f64, knots: &[f64], period: f64| {
-            knot_on_way(x0, x, 1.0, knots, period).map_or((x, velocity), |(_, at)| (at, x0 - x))
+        let read = |x: f64, x0: f64, velocity: f64, knots: &[f64], period: f64| -> Result<_> {
+            Ok(knot_on_way(x0, x, 1.0, knots, period)?
+                .map_or((x, velocity), |(_, at)| (at, x0 - x)))
         };
-        let (ue, ua) = read(u, from[0], a, &self.knots.0, self.periods.0);
-        let (ve, vb) = read(v, from[1], b, &self.knots.1, self.periods.1);
+        let (ue, ua) = read(u, from[0], a, &self.knots.0, self.periods.0)?;
+        let (ve, vb) = read(v, from[1], b, &self.knots.1, self.periods.1)?;
         let d = self.derivs(self.inside(Point2::new(ue, ve))?, (ua, vb))?;
         let q = d.suu * (a * a) + d.suv * (2.0 * a * b) + d.svv * (b * b);
         // [E F; F G] (a', b') = -(S_u . Q, S_v . Q)
@@ -412,7 +449,7 @@ impl Shoot<'_> {
             }
             let hh = h.min(left);
             let next = step(s, hh)?;
-            if let Some((f, axis, at)) = self.first_knot(s, next, (left / hh).min(1.5)) {
+            if let Some((f, axis, at)) = self.first_knot(s, next, (left / hh).min(1.5))? {
                 // where the step meets the knot: Newton's rule on the parameter along the
                 // geodesic, its rate the state's own (du/ds, dv/ds)
                 let mut cut = (f * hh).min(left);
@@ -448,16 +485,23 @@ impl Shoot<'_> {
     /// The fraction of the way from state `s` to state `next` (by the parameters, linearly, up
     /// to `reach` times the way) where the first knot line after `s` lies, if any, with its
     /// parameter (0: u, 1: v) and its value on the way (a periodic surface's knot a whole
-    /// period on as needed).
-    fn first_knot(&self, s: [f64; 4], next: [f64; 4], reach: f64) -> Option<(f64, usize, f64)> {
+    /// period on as needed); refused as [`knot_on_way`] refuses.
+    fn first_knot(
+        &self,
+        s: [f64; 4],
+        next: [f64; 4],
+        reach: f64,
+    ) -> Result<Option<(f64, usize, f64)>> {
         let [u0, v0, _, _] = s;
         let [u1, v1, _, _] = next;
-        let u = knot_on_way(u0, u1, reach, &self.knots.0, self.periods.0).map(|(f, at)| (f, 0, at));
-        let v = knot_on_way(v0, v1, reach, &self.knots.1, self.periods.1).map(|(f, at)| (f, 1, at));
-        match (u, v) {
+        let u =
+            knot_on_way(u0, u1, reach, &self.knots.0, self.periods.0)?.map(|(f, at)| (f, 0, at));
+        let v =
+            knot_on_way(v0, v1, reach, &self.knots.1, self.periods.1)?.map(|(f, at)| (f, 1, at));
+        Ok(match (u, v) {
             (Some(a), Some(b)) => Some(if b.0 < a.0 { b } else { a }),
             (a, b) => a.or(b),
-        }
+        })
     }
 
     /// The end of the geodesic of length `distance` leaving the curve at its parameter `t`,
