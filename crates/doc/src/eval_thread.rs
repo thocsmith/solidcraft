@@ -31,6 +31,14 @@ pub struct ThreadInfo {
 }
 
 impl ThreadInfo {
+    /// This record carried by a rigid motion `m` of its body (a plain move): its axis moved with the
+    /// body, everything else kept. None when `m` does not give a finite axis.
+    pub(crate) fn moved(&self, m: &crate::Mat) -> Option<ThreadInfo> {
+        let axis = crate::apply_vector(m, *self.axis).unit()?;
+        let axis_point = crate::apply_point(m, self.axis_point);
+        axis_point.is_finite().then(|| ThreadInfo { axis_point, axis, ..self.clone() })
+    }
+
     /// Whether two cosmetic thread markings agree on every field, bit for bit (distinguishing
     /// `0.0` from `-0.0`). Every field is destructured so a new one cannot be left out.
     pub(crate) fn same_bits(&self, other: &Self) -> bool {
@@ -92,6 +100,12 @@ pub fn suggested_thread_in(st: &ModelState, p: Vec3, form: ThreadForm) -> Result
     thread_on(st, 0, p, &ThreadAsk { form: Some(form), ..Default::default() }).map(|t| t.info.designation)
 }
 
+/// Why a Thread's `offset` below zero is refused, by the command (a typed value) and by evaluation
+/// (an expression whose parameters made it negative) alike.
+pub const THREAD_OFFSET_NEGATIVE: &str = "a thread's offset must be 0 or more: it is how far from the end it starts at (`from`) the thread starts";
+/// Why a Thread's `offset` is refused with a chamfered tip at its start, by the command and by evaluation.
+pub const THREAD_OFFSET_WITH_TIP: &str = "a chamfered tip at the start needs the thread to start at a free end, and with an offset it starts inside the face: leave out the offset, or chamfer only the far end with `tip: both`";
+
 /// How far a thread runs along its face.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(super) enum Extent {
@@ -120,6 +134,9 @@ pub(super) struct ThreadAsk<'a> {
     pub extent: Extent,
     /// A point near the end of the face the thread starts at.
     pub from: Option<Vec3>,
+    /// How far in from that end the thread starts (mm, 0 or more; 0: at the end). The extent is
+    /// measured from there.
+    pub offset: f64,
     /// A modelled thread needs to know how each of its ends meets the face's ends.
     pub modeled: bool,
     /// The runout at the end away from where the thread starts, as (mm, pitches): its length
@@ -401,10 +418,36 @@ pub(super) fn thread_on_in(st: &ModelState, feature: u64, component: Option<u64>
     let mut ends = FaceEnds { body: &mb.body, cyl: &cyl, band, beyond, pitch, free: [None; 2] };
     let (lo, hi) = (cyl.start, cyl.end);
     let along = |q: Vec3| (q - cyl.axis_point).dot(cyl.axis);
+    // The offset start: how far in from the end it starts at the thread starts. Only a thread with
+    // an offset changes here: without one, every extent keeps its rule for the end it starts at.
+    let offset = ask.offset;
+    if !(offset >= 0.0 && offset.is_finite()) {
+        return Err(DocError::Invalid(THREAD_OFFSET_NEGATIVE.into()));
+    }
+    let offset_given = offset > 0.0;
+    if offset_given && offset >= hi - lo - pitch * 1e-3 {
+        return Err(DocError::Invalid(format!(
+            "the thread's offset ({} mm) is as long as the face ({} mm) or longer: it leaves nothing to thread",
+            show_mm(offset),
+            show_mm(hi - lo)
+        )));
+    }
+    if offset_given && form.is_taper() {
+        return Err(DocError::Invalid(format!(
+            "a taper pipe thread starts at the {}, where its standard puts its gauge diameter: it takes no offset",
+            if cyl.internal { "hole's mouth" } else { "pipe's end" }
+        )));
+    }
+    let start_of = |side: usize| if side == 0 { lo + offset } else { hi - offset };
     let span = |side: usize, to: f64| -> Result<(f64, f64)> {
-        let (a, b) = if side == 0 { (lo, to.min(hi)) } else { (to.max(lo), hi) };
+        let s = start_of(side);
+        let (a, b) = if side == 0 { (s, to.min(hi)) } else { (to.max(lo), s) };
         if !(b - a > pitch * 1e-3) {
-            return Err(DocError::Invalid("the thread's limit is not along the face from the end it starts at".into()));
+            return Err(DocError::Invalid(if offset_given {
+                "the thread's limit is not along the face past its offset from the end it starts at".into()
+            } else {
+                "the thread's limit is not along the face from the end it starts at".into()
+            }));
         }
         Ok((a, b))
     };
@@ -416,12 +459,29 @@ pub(super) fn thread_on_in(st: &ModelState, feature: u64, component: Option<u64>
         (e, _) => e,
     };
     let (a, b, side) = match extent {
+        Extent::Full if offset_given => {
+            let side = from_side(&mut ends)?;
+            let (a, b) = span(side, if side == 0 { hi } else { lo })?;
+            (a, b, side)
+        }
         Extent::Full => (lo, hi, ask.from.map(|q| usize::from((along(q) - lo).abs() > (hi - along(q)).abs())).unwrap_or(0)),
         Extent::Length(l) => {
             if !(l > 0.0) {
                 return Err(DocError::Invalid("thread length must be positive".into()));
             }
-            if l >= hi - lo - pitch * 1e-3 {
+            if offset_given {
+                // From the offset start; as long as what is left of the face (or longer): to its far end.
+                let side = from_side(&mut ends)?;
+                // A far end within a thousandth of a pitch of the face's end is that end.
+                let to = match side {
+                    0 if start_of(0) + l >= hi - pitch * 1e-3 => hi,
+                    0 => start_of(0) + l,
+                    _ if start_of(1) - l <= lo + pitch * 1e-3 => lo,
+                    _ => start_of(1) - l,
+                };
+                let (a, b) = span(side, to)?;
+                (a, b, side)
+            } else if l >= hi - lo - pitch * 1e-3 {
                 // As long as the face (or longer): it runs the whole face from either end.
                 (lo, hi, ask.from.map(|q| usize::from((along(q) - lo).abs() > (hi - along(q)).abs())).unwrap_or(0))
             } else {
@@ -865,6 +925,7 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
         face,
         designation,
         length,
+        offset,
         modeled,
         continuous_flanks,
         from,
@@ -899,6 +960,13 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
     if *to_bottom && (!*modeled || ease_out.is_some()) {
         return Err(DocError::Invalid("a thread runs to the bottom only when it is modelled and its end does not fade out".into()));
     }
+    let offset = offset.as_deref().map(|e| val(vals, e, Kind::Length)).transpose()?.unwrap_or(0.0);
+    if !(offset >= 0.0 && offset.is_finite()) {
+        return Err(DocError::Invalid(THREAD_OFFSET_NEGATIVE.into()));
+    }
+    if offset > 0.0 && *tip == ThreadTip::Start {
+        return Err(DocError::Invalid(THREAD_OFFSET_WITH_TIP.into()));
+    }
     let extent = match (length, up_to) {
         (Some(e), _) => Extent::Length(val(vals, e, Kind::Length)?),
         (None, Some(crate::ThreadLimit::Face(q))) => Extent::UpToPoint(q.0),
@@ -916,6 +984,7 @@ pub(super) fn eval(doc: &Document, vals: &BTreeMap<String, Value>, f: &Feature, 
         steep: *steep_flank,
         extent,
         from: from.map(|q| q.0),
+        offset,
         modeled: *modeled,
         ease_out: (0.0, 0.0),
         to_bottom: *to_bottom,
@@ -1064,6 +1133,92 @@ fn cut_grouped(st: &ModelState, selected: &[ThreadOn], continuous_flanks: bool) 
     // Nothing enters the live state or its validation scope until every target succeeded.
     for (name, body) in checked {
         super::remember_checked_thread_output(&name, &body);
+    }
+    Ok(Some(next))
+}
+
+/// The box one tap's groove tool lies in: the groove reaches at most the major radius and
+/// overruns a free end by one pitch.
+fn tap_tool_box(on: &ThreadOn) -> Option<solidcraft_geom::Aabb3> {
+    let pad = on.info.pitch + on.ease[0] + on.ease[1];
+    let (lo, hi) = (on.info.start.min(on.info.end) - pad, on.info.start.max(on.info.end) + pad);
+    let axis = *on.info.axis;
+    let bounds = solidcraft_geom::Aabb3::from_iter([on.info.axis_point + axis * lo, on.info.axis_point + axis * hi])
+        .inflated(on.info.major_diameter * 0.5 + on.info.pitch);
+    (bounds.min.is_finite() && bounds.max.is_finite() && !bounds.is_empty()).then_some(bounds)
+}
+
+fn tap_tools_apart(group: &[&ThreadOn]) -> bool {
+    let mut boxes = Vec::with_capacity(group.len());
+    for on in group {
+        let Some(bounds) = tap_tool_box(on) else { return false };
+        if boxes.iter().any(|other| bounds.meets(other)) {
+            return false;
+        }
+        boxes.push(bounds);
+    }
+    true
+}
+
+/// Plain internal taps lying apart share one cut per body and its one validity check. `None`
+/// leaves every tap on [`cut`]: an unsupported tap, overlapping tools or a refused boolean.
+pub(super) fn cut_apart_taps(st: &ModelState, ons: &[ThreadOn]) -> Result<Option<ModelState>> {
+    if ons.len() < 2 || super::EVAL_VALIDATION.get() != kernel::Validation::EachFeature {
+        return Ok(None);
+    }
+    if ons
+        .iter()
+        .any(|on| !on.info.internal || on.info.form.is_taper() || on.narrow.is_some() || on.shoulder_unchecked || on.ends.contains(&End::Shoulder))
+    {
+        return Ok(None);
+    }
+    let mut groups: BTreeMap<&str, Vec<&ThreadOn>> = BTreeMap::new();
+    for on in ons {
+        groups.entry(on.info.body.as_str()).or_default().push(on);
+    }
+    if groups.values().any(|group| !tap_tools_apart(group)) {
+        return Ok(None);
+    }
+    let mut next = st.clone();
+    let mut checked = Vec::new();
+    for (name, group) in groups {
+        let index = st.bodies.iter().position(|body| body.name == name).ok_or_else(|| DocError::Invalid("threaded body".into()))?;
+        let original = st.bodies.get(index).ok_or_else(|| DocError::Invalid("threaded body".into()))?;
+        let mut tools = Vec::with_capacity(group.len());
+        for on in group {
+            match groove_tool(&on.info, on.cyl, on.ends, on.steep, on.ease, on.cyl.radius, None, false) {
+                Ok(tool) => tools.push(tool),
+                Err(DocError::Kernel(_)) => return Ok(None),
+                Err(error) => return Err(error),
+            }
+        }
+        let tool = match tools.as_slice() {
+            [one] => one.clone(),
+            many => match kernel::join_apart(many) {
+                Ok(Some(one)) => one,
+                Ok(None) | Err(_) => return Ok(None),
+            },
+        };
+        #[cfg(test)]
+        super::cost_tests::count(|c| c.thread_cuts += 1);
+        let body = match kernel::boolean(&original.body, &tool, BoolOp::Cut) {
+            Ok(Some(body)) => body,
+            Ok(None) => return Err(DocError::Invalid("the threads removed everything".into())),
+            Err(_) => return Ok(None),
+        };
+        if super::check_feature_body(&body).is_err() {
+            return Ok(None);
+        }
+        let faces = crate::lineage::Lineage::unnamed(&tool);
+        let lineage = original.traced().lineage.and_then(|lineage| crate::lineage::Lineage::step(&body, &[&lineage, &faces]));
+        checked.push((original.name.clone(), body.clone()));
+        if let Some(slot) = next.bodies.get_mut(index) {
+            *slot = original.remade(Traced { body, lineage, recipe: None });
+        }
+    }
+    // Nothing enters the live state or its validation scope until every body succeeded.
+    for (name, body) in &checked {
+        super::remember_checked_thread_output(name, body);
     }
     Ok(Some(next))
 }
@@ -1306,6 +1461,7 @@ mod tests {
             steep: SteepFlank::default(),
             extent: Extent::Full,
             from: None,
+            offset: 0.0,
             modeled: true,
             ease_out: (0.0, 0.0),
             to_bottom: false,
