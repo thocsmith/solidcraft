@@ -1031,15 +1031,25 @@ fn drafted_pair(look: &Look, faces: [usize; 2], a: &Flat, b: &Flat, d: &DraftedP
     let what = format!("faces {} and {}", faces[0], faces[1]);
     let (pa, pb) = (outward(a), outward(b));
     let thick = |points: &[[f64; 3]]| drafted_thickness(&pa, &pb, points).map_err(ops_err(&what));
-    // A first look, at the first face's own inner point: past three times the limit there, or
-    // with no material behind it, no closer look is worth the region booleans.
-    let Some(seen_at) = inside_point(body, q, faces[0], Some(a), None, tol) else { return Ok(Drafted::NoWall) };
-    let first_look = thick(&[seen_at])?.first().copied().unwrap_or(0.0);
-    if first_look <= tol {
+    // A first look, before the region booleans. The thickness is linear across the bisector, and
+    // a face's thickness carries over to its image there, so over what the two faces share it lies
+    // between the larger of the two faces' least and the smaller of their greatest, read at the
+    // exact points of their edges (their corners among them; between an arc's points the
+    // reading is a little short, which the slack below absorbs). Only when that whole range is
+    // far out is the pair passed over: its least past three times the limit, or its greatest
+    // behind both faces by more than the limit (air between, or the faces' far side).
+    let (Some(edge_a), Some(edge_b)) = (edge_points(q, faces[0]), edge_points(q, faces[1])) else { return Ok(Drafted::NoWall) };
+    let range = |points: &[[f64; 3]]| -> Result<(f64, f64)> {
+        let t = thick(points)?;
+        Ok((t.iter().copied().fold(f64::INFINITY, f64::min), t.iter().copied().fold(f64::NEG_INFINITY, f64::max)))
+    };
+    let ((least_a, most_a), (least_b, most_b)) = (range(&edge_a)?, range(&edge_b)?);
+    let (least, most) = (least_a.max(least_b), most_a.min(most_b));
+    if !(least.is_finite() && most.is_finite()) || most < -(opts.max_thickness + tol) {
         return Ok(Drafted::NoWall);
     }
-    if first_look > opts.max_thickness * 3.0 + tol {
-        return Ok(Drafted::Missed(first_look));
+    if least > opts.max_thickness * 3.0 + tol {
+        return Ok(Drafted::Missed(least));
     }
     let plane = Plane { origin: vec3(d.bisector.point), x: vec3(d.x), y: vec3(d.y) };
     let frame = frame_of(&plane);
@@ -1074,7 +1084,7 @@ fn drafted_pair(look: &Look, faces: [usize; 2], a: &Flat, b: &Flat, d: &DraftedP
     let mut notes = Vec::new();
     let outline = boolean(&[filled(&ra)], &[filled(&rb)], BoolOp::Intersect)?;
     if outline.iter().map(Region2::area).sum::<f64>() <= tol * tol {
-        return Ok(Drafted::Missed(first_look));
+        return Ok(Drafted::Missed(least.max(0.0)));
     }
     // The wall's thickness at every corner of what the two share (an arc's points too): linear
     // across the bisector, so its least and greatest are there.
@@ -1177,7 +1187,8 @@ fn drafted_pair(look: &Look, faces: [usize; 2], a: &Flat, b: &Flat, d: &DraftedP
     let confidence = if notes.is_empty() { Confidence::High } else { Confidence::Review };
     let point_b = face_region(body, q, &b.plane, b.out, faces[1], tol)
         .and_then(|r| ms::from_frame(&frame_of(&b.plane), [r.interior_point().x, r.interior_point().y]).ok());
-    let (Some(point_b), point_a) = (point_b, seen_at) else { return Ok(Drafted::NoWall) };
+    let point_a = inside_point(body, q, faces[0], Some(a), None, tol);
+    let (Some(point_a), Some(point_b)) = (point_a, point_b) else { return Ok(Drafted::NoWall) };
     Ok(Drafted::Pair(Box::new(Pair {
         faces,
         points: [point_a, point_b],
@@ -3079,5 +3090,37 @@ mod tests {
             assert!(side.corners.iter().any(|c| (c[1] - corner[1]).abs() < 1e-6), "{corner:?}: {side:?}");
         }
         assert!(surface_body(&s).is_ok());
+    }
+
+    #[test]
+    fn a_drafted_wall_pairs_when_both_faces_reach_far_past_what_they_share() {
+        // Two blocks 40 deep offset like a Z, joined by a wall only 10 long: the bottom face y = 0
+        // runs from x = 0 to 400 under the right block, and the face drafted 3 degrees over it,
+        // y = 2 + x tan 3, runs from x = 10 back to -390 over the left block. They share x = 0 to
+        // 10, where the wall is 2 to 2.5 thick. Neither face's middle lies there: at the bottom's
+        // (x = 200) the drafted plane is about 12.5 away, past three times the 3 mm limit; the
+        // drafted face's (x = -190) lies below the bottom's plane, with no material between. The
+        // first look must read the faces' whole extents, not one point of either.
+        let t = 3.0_f64.to_radians().tan();
+        let y = |x: f64| 2.0 + x * t;
+        let pts = [
+            Vec2::new(0.0, 0.0),
+            Vec2::new(400.0, 0.0),
+            Vec2::new(400.0, 30.0),
+            Vec2::new(10.0, 30.0),
+            Vec2::new(10.0, y(10.0)),
+            Vec2::new(-390.0, y(-390.0)),
+            Vec2::new(-390.0, -30.0),
+            Vec2::new(0.0, -30.0),
+        ];
+        let body = extrude(&Plane::XY, &[Region2 { outer: Loop2::polygon(&pts), holes: vec![] }], 0.0, 40.0).unwrap().pop().unwrap();
+        let a = analyze(&body, &opts(3.0)).unwrap();
+        let drafted: Vec<&Pair> = a.pairs.iter().filter(|p| p.draft > 0.0).collect();
+        assert_eq!(drafted.len(), 1, "{a:?}");
+        let p = drafted[0];
+        assert!((p.draft - 3.0).abs() < 1e-9, "{p:?}");
+        assert!(p.thinnest > 1.9 && p.thickest < 2.6 && p.thinnest < p.thickest, "{p:?}");
+        // The sheet covers what the faces share: about 10 by 40.
+        assert!((p.overlap_area - 400.0).abs() < 5.0, "{p:?}");
     }
 }
