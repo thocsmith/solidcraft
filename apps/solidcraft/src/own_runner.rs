@@ -5,13 +5,14 @@
 //! windows present without waiting for vsync and the blur draws through our own painter, with
 //! egui-wgpu as it ships. What eframe does around the app, it does too: the settings file
 //! (`app.ron`, written the same way), egui's memory in it, saving every `auto_save_interval` and
-//! at exit, and the control channel's logic passes (#743). Not yet: the window's size and place
-//! are not restored from the last run, and `Frame::storage_mut` is `None` during a pass (the app
-//! saves through `App::save`).
+//! at exit, the main window's size and place (`persist_window`), and the control channel's logic
+//! passes (#743). eframe's `Frame::storage_mut` is `None` here; the app is handed the settings
+//! file after each pass instead (`App::write_settings`).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use eframe::App as _;
 use solidcraft_window_gpu::runner::{self, Created, Frame, RunOptions};
 
 /// The variable that chooses the runner (after the `SOLIDCRAFT_` prefix): `own` runs ours.
@@ -59,15 +60,20 @@ impl eframe::Storage for Settings {
 /// egui's memory in the settings file, under eframe's key.
 const EGUI_MEMORY: &str = "egui";
 
+/// The main window's size and place in the settings file, under eframe's key.
+const WINDOW: &str = "window";
+
 /// The app on our runner.
-struct OnRunner<'a> {
-    app: Box<dyn eframe::App + 'a>,
+struct OnRunner {
+    app: crate::App,
     frame: eframe::Frame,
     settings: Settings,
     ctx: egui::Context,
+    /// `NativeOptions::persist_window`.
+    persist_window: bool,
 }
 
-impl OnRunner<'_> {
+impl OnRunner {
     fn sync(&mut self, frame: &Frame<'_>) {
         if self.frame.wgpu_render_state.is_none() {
             self.frame.wgpu_render_state = frame.render_state().cloned();
@@ -75,7 +81,7 @@ impl OnRunner<'_> {
     }
 }
 
-impl runner::App for OnRunner<'_> {
+impl runner::App for OnRunner {
     fn logic(&mut self, ctx: &egui::Context, frame: &Frame<'_>) {
         self.sync(frame);
         self.app.logic(ctx, &mut self.frame);
@@ -83,6 +89,9 @@ impl runner::App for OnRunner<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, frame: &Frame<'_>) {
         self.sync(frame);
         self.app.ui(ui, &mut self.frame);
+        // eframe's `Frame::storage_mut` is the settings file during a pass; here the app is
+        // handed ours after it (#8275: a changed setting is written soon, not at the next save).
+        self.app.write_settings(ui.ctx(), &mut self.settings, std::time::Instant::now());
     }
     fn clear_color(&self, visuals: &egui::Visuals) -> [f32; 4] {
         self.app.clear_color(visuals)
@@ -95,6 +104,11 @@ impl runner::App for OnRunner<'_> {
     }
     fn repaint_on_device_event(&mut self, event: &winit::event::DeviceEvent) -> Option<bool> {
         self.app.repaint_on_device_event(event)
+    }
+    fn window_settings(&mut self, settings: solidcraft_window_gpu::egui_winit::WindowSettings) {
+        if self.persist_window {
+            eframe::set_value(&mut self.settings, WINDOW, &settings);
+        }
     }
     fn save(&mut self) {
         if self.app.persist_egui_memory() {
@@ -116,7 +130,15 @@ impl runner::App for OnRunner<'_> {
 
 /// Run the window on our own runner, as `eframe::run_native` would with `options` and `creator`:
 /// the same viewport, device setup, settings file and app. `x11` starts winit on X11 (Linux).
-pub fn run(options: eframe::NativeOptions, creator: eframe::AppCreator<'_>, x11: bool, wake: &crate::control_server::Wake) -> eframe::Result {
+pub fn run(
+    options: eframe::NativeOptions,
+    creator: impl FnOnce(
+        &eframe::CreationContext<'_>,
+        Option<std::sync::Arc<winit::window::Window>>,
+    ) -> Result<crate::App, Box<dyn std::error::Error + Send + Sync>>,
+    x11: bool,
+    wake: &crate::control_server::Wake,
+) -> eframe::Result {
     solidcraft_engine::note!("SolidCraft: the window runs on its own runner (SOLIDCRAFT_{ENV}=own)");
     let renderer = eframe::egui_wgpu::RendererOptions {
         msaa_samples: u32::from(options.multisampling.max(1)),
@@ -136,12 +158,16 @@ pub fn run(options: eframe::NativeOptions, creator: eframe::AppCreator<'_>, x11:
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     let _ = x11;
     let settings = Settings::open(options.persistence_path.clone());
-    let run_options = RunOptions { viewport: options.viewport, wgpu: options.wgpu_options, renderer, transparent, event_loop_builder };
+    let persist_window = options.persist_window;
+    let window_settings =
+        if persist_window { eframe::get_value::<solidcraft_window_gpu::egui_winit::WindowSettings>(&settings, WINDOW) } else { None };
+    let run_options =
+        RunOptions { viewport: options.viewport, wgpu: options.wgpu_options, renderer, transparent, event_loop_builder, window_settings };
     let failed: std::rc::Rc<std::cell::RefCell<Option<String>>> = std::rc::Rc::default();
     let failed_in_create = failed.clone();
     let wake = wake.clone();
     let ran = runner::run(run_options, move |created: Created| {
-        let Created { ctx, render_state, waker } = created;
+        let Created { ctx, render_state, waker, window } = created;
         wake.set(move || waker.run_logic());
         if let Some(memory) = settings.kv.get(EGUI_MEMORY).and_then(|m| ron::from_str::<egui::Memory>(m).ok()) {
             ctx.memory_mut(|m| *m = memory);
@@ -149,12 +175,13 @@ pub fn run(options: eframe::NativeOptions, creator: eframe::AppCreator<'_>, x11:
         let mut cc = eframe::CreationContext::_new_kittest(ctx.clone());
         cc.storage = Some(&settings);
         cc.wgpu_render_state = render_state.clone();
-        let made = creator(&cc);
+        // eframe's `CreationContext` has no window here; the app takes ours.
+        let made = creator(&cc, window);
         drop(cc);
         let mut frame = eframe::Frame::_new_kittest();
         frame.wgpu_render_state = render_state;
         match made {
-            Ok(app) => Box::new(OnRunner { app, frame, settings, ctx }),
+            Ok(app) => Box::new(OnRunner { app, frame, settings, ctx, persist_window }),
             Err(e) => {
                 *failed_in_create.borrow_mut() = Some(e.to_string());
                 Box::new(Closing)
