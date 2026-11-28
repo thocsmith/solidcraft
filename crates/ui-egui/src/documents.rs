@@ -44,6 +44,7 @@ pub struct DocSlot {
     cam: Camera,
     pub(crate) pending_feature_edit: Option<crate::feature_edit::PendingFeatureEdit>,
     pre_sketch_cam: Option<crate::PreSketchView>,
+    sketch_last_views: crate::SketchLastViews,
     pre_sketch_component: Option<crate::PreSketchComponent>,
     pre_edit_component: Option<crate::PreEditComponent>,
     view: DocView,
@@ -181,6 +182,7 @@ impl DocSlot {
             cam: Camera::default(),
             pending_feature_edit: None,
             pre_sketch_cam: None,
+            sketch_last_views: Default::default(),
             pre_sketch_component: None,
             pre_edit_component: None,
             view: DocView::default(),
@@ -272,6 +274,11 @@ pub struct Documents {
     navigation: ViewNavigation,
     /// Recalled framing waits for selection, across passive native-window swaps.
     restore_views: bool,
+    /// Where the designs' views are remembered for "Reopen a design's views next time it opens".
+    pub(crate) view_memory: crate::view_memory::Store,
+    /// A remembered Model camera was shown ([`apply_recalled_view`]): a program's command that
+    /// opened the design leaves it as it is (`control::execute`).
+    pub(crate) camera_recalled: bool,
     /// A view's name being typed in its sub-tab ([`view_rename_start`]).
     pub(crate) view_rename: Option<ViewRename>,
     /// Click placement in progress (design tab id, view id).
@@ -573,6 +580,7 @@ fn swap_in(app: &mut SolveApp, mut slot: DocSlot, presenting: bool) -> DocSlot {
         cam: std::mem::replace(&mut app.cam, slot.cam),
         pending_feature_edit: std::mem::replace(&mut app.pending_feature_edit, slot.pending_feature_edit),
         pre_sketch_cam: std::mem::replace(&mut app.pre_sketch_cam, slot.pre_sketch_cam),
+        sketch_last_views: std::mem::replace(&mut app.sketch_last_views, slot.sketch_last_views),
         pre_sketch_component: std::mem::replace(&mut app.pre_sketch_component, slot.pre_sketch_component),
         pre_edit_component: std::mem::replace(&mut app.pre_edit_component, slot.pre_edit_component),
         view: take_view(app),
@@ -1134,6 +1142,15 @@ fn apply_recalled_view(app: &mut SolveApp, view: &DesignView) {
     apply_view(app, view);
     (app.ui.perspective, app.ui.up_axis) = projection;
     show_look(app, view);
+    // The remembered camera is shown as it was left. The framing the open asked for, the app's
+    // first one in a new session, and the one the open makes once its parts are meshed would each
+    // keep its direction but change its zoom and centre (#23271).
+    if view.kind == ViewKind::Model && view.spec.is_some() {
+        app.pending_fit = None;
+        app.fitted = true;
+        crate::open_meshing::keep_camera(app);
+        app.docs.camera_recalled = true;
+    }
 }
 
 /// Run `draw` with the Model view `id` standing in for the shown one: its camera and analyses are
@@ -1228,14 +1245,14 @@ fn can_restore(session: &Session, kind: ViewKind, subject: Option<&str>) -> bool
     }
 }
 
-/// Remember the views of design tab `i` in `dir`, when it is saved to a file and Preferences ask
-/// for views to come back ([`restore_views_in`]).
-fn remember_views_in(app: &SolveApp, i: usize, dir: &std::path::Path) {
+/// The views of design tab `i` to remember, by its file, when it is saved to a file and
+/// Preferences ask for views to come back ([`restore_views_from`]).
+fn views_to_remember(app: &SolveApp, i: usize) -> Option<(String, Value)> {
     if !app.preferences.design_reopen_views {
-        return;
+        return None;
     }
     let session = if i == app.docs.active { Some(&app.session) } else { app.docs.slots.get(i).and_then(Option::as_ref).map(|slot| &slot.session) };
-    let (Some(path), Some(views)) = (session.and_then(|session| session.path.as_deref()), views_of(app, i)) else { return };
+    let (Some(path), Some(views)) = (session.and_then(|session| session.path.as_deref()), views_of(app, i)) else { return None };
     // Every design keeps its live camera, including one parked in a background slot.
     let mut views = views.clone();
     let camera = if i == app.docs.active { Some(app.cam) } else { app.docs.slots.get(i).and_then(Option::as_ref).map(|slot| slot.cam) };
@@ -1250,29 +1267,77 @@ fn remember_views_in(app: &SolveApp, i: usize, dir: &std::path::Path) {
     for window in windows {
         views.close_window(window);
     }
-    let remembered = crate::view_memory::remember_async(dir.to_owned(), path.to_owned(), views.to_json());
-    if let Err(e) = remembered {
+    Some((path.to_owned(), views.to_json()))
+}
+
+/// Remember the views of design tab `i` where the app keeps them ([`Documents::view_memory`]).
+pub(crate) fn remember_views(app: &mut SolveApp, i: usize) {
+    let Some((path, views)) = views_to_remember(app, i) else { return };
+    if let Err(e) = app.docs.view_memory.remember(&path, views) {
         log::warn!("could not remember the views of {path}: {e}");
     }
 }
 
-/// [`remember_views_in`] in the user's data folder.
-pub(crate) fn remember_views(app: &SolveApp, i: usize) {
-    if let Some(dir) = solidcraft_engine::recovery::data_dir() {
-        remember_views_in(app, i, &dir);
+/// Remember the views of every open design: the browser page is going away without quitting
+/// the app (closed, reloaded or left), so this is the last chance (#23271).
+pub fn remember_all_views(app: &mut SolveApp) {
+    for i in 0..app.docs.count() {
+        remember_views(app, i);
     }
 }
 
-/// Give the design just opened from `path` the views it was closed with, from `dir`: those that
-/// can still be shown ([`can_restore`]). The design shown also shows its active one.
+/// The browser's shell keeps the remembered views in the browser's storage: `saved` is what it
+/// kept last time (none: nothing yet). From now on the views are remembered in memory, and
+/// [`view_memory_to_save`] gives them back to keep.
+pub fn use_host_view_memory(app: &mut SolveApp, saved: Option<&str>) {
+    app.docs.view_memory = crate::view_memory::Store::Host(crate::view_memory::Host::load(saved));
+}
+
+/// The remembered views to keep in the host's storage: `saved_now` (what the storage holds now,
+/// which another page of the app may have changed) with this page's changes on top. The host then
+/// says whether its storage took them ([`view_memory_saved`]).
+pub fn view_memory_to_save(app: &mut SolveApp, saved_now: Option<&str>) -> Option<String> {
+    match &mut app.docs.view_memory {
+        crate::view_memory::Store::Host(host) => host.pending_text(saved_now),
+        _ => None,
+    }
+}
+
+/// Whether the host's storage took what [`view_memory_to_save`] gave; if not, the changes stay
+/// and are tried again with the next one.
+pub fn view_memory_saved(app: &mut SolveApp, taken: bool) {
+    if let crate::view_memory::Store::Host(host) = &mut app.docs.view_memory {
+        host.saved(taken);
+    }
+}
+
+/// Whether there are remembered views for the host to save now ([`view_memory_to_save`]).
+pub fn view_memory_changed(app: &SolveApp) -> bool {
+    matches!(&app.docs.view_memory, crate::view_memory::Store::Host(host) if host.changed())
+}
+
+/// Remember the views of design tab `i` in the folder `dir`.
+#[cfg(test)]
+fn remember_views_in(app: &SolveApp, i: usize, dir: &std::path::Path) {
+    if let Some((path, views)) = views_to_remember(app, i) {
+        crate::view_memory::remember_async(dir.to_owned(), path, views).unwrap();
+    }
+}
+
+/// [`restore_views_from`] with what is remembered in `dir`.
+#[cfg(test)]
 fn restore_views_in(app: &mut SolveApp, path: &str, dir: &std::path::Path) {
+    restore_views_from(app, path, crate::view_memory::recall(dir, path));
+}
+
+/// Give the design just opened from `path` the views it was closed with (`saved`): those that
+/// can still be shown ([`can_restore`]). The design shown also shows its active one.
+fn restore_views_from(app: &mut SolveApp, path: &str, saved: Option<Value>) {
     if !app.preferences.design_reopen_views {
         return;
     }
     let Some(session) = session_at(app, path) else { return };
-    let Some(mut set) = crate::view_memory::recall(dir, path)
-        .and_then(|saved| crate::view_memory::restorable(&saved, |kind, subject| can_restore(session, kind, subject)))
-    else {
+    let Some(mut set) = saved.and_then(|saved| crate::view_memory::restorable(&saved, |kind, subject| can_restore(session, kind, subject))) else {
         return;
     };
     let windows: Vec<_> = set.windows().iter().map(|window| window.id).collect();
@@ -1322,8 +1387,9 @@ fn restore_views_in(app: &mut SolveApp, path: &str, dir: &std::path::Path) {
 /// remembered views back, and the shown one takes the view the command line asked to start on
 /// (`--view`, once).
 pub(crate) fn design_opened(app: &mut SolveApp, path: &str) {
-    if let Some(dir) = solidcraft_engine::recovery::data_dir() {
-        restore_views_in(app, path, &dir);
+    if app.preferences.design_reopen_views {
+        let saved = app.docs.view_memory.recall(path);
+        restore_views_from(app, path, saved);
     }
     if app.session.path.as_deref().is_some_and(|p| same_path(p, path))
         && let Some(kind) = crate::new_window::take_start_view().and_then(|key| ViewKind::from_key(&key))
@@ -1612,6 +1678,18 @@ pub fn view_counts(app: &SolveApp) -> Vec<usize> {
     (0..app.docs.count()).map(|design| views_of(app, design).map_or(1, ViewSet::len)).collect()
 }
 
+/// Whether the sub-tabs of the design in tab `design` are folded into its tab. False for a tab
+/// that does not exist.
+pub fn views_collapsed(app: &SolveApp, design: usize) -> bool {
+    views_of(app, design).is_some_and(ViewSet::collapsed)
+}
+
+/// Fold the shown design's sub-tabs into its tab (`collapsed`: its name and how many views it
+/// has, with a chevron that shows them again), or show them. The views are unchanged.
+pub fn view_collapse(app: &mut SolveApp, collapsed: bool) {
+    app.docs.views.set_collapsed(collapsed);
+}
+
 fn views_of(app: &SolveApp, design: usize) -> Option<&ViewSet> {
     if design == app.docs.active { Some(&app.docs.views) } else { app.docs.slots.get(design)?.as_ref().map(|slot| &slot.views) }
 }
@@ -1807,6 +1885,11 @@ fn view_command_local(app: &mut SolveApp, command: &str, mut v: Value) -> Result
             crate::view_windows::detach(app, asked, &v)?;
             Some(asked)
         }
+        "tab.view.collapse" => {
+            let collapsed = v.get("collapsed").and_then(Value::as_bool).unwrap_or(!app.docs.views.collapsed());
+            view_collapse(app, collapsed);
+            None
+        }
         "tab.view.move" => {
             let len = app.docs.views.len();
             let (from, to) = (place("from").filter(|n| *n < len), place("to").filter(|n| *n < len));
@@ -1820,6 +1903,9 @@ fn view_command_local(app: &mut SolveApp, command: &str, mut v: Value) -> Result
     if let Some(reply) = v.as_object_mut() {
         if let Some(id) = id {
             reply.insert("id".into(), json!(id));
+        }
+        if matches!(command, "tab.view.collapse" | "tab.view.list") {
+            reply.insert("collapsed".into(), json!(app.docs.views.collapsed()));
         }
         if command == "tab.view.list" {
             let list = views_info(app, app.docs.active)
@@ -2020,6 +2106,7 @@ pub fn adopt(app: &mut SolveApp, mut session: Session) -> bool {
         crate::design_properties::close_object(app);
         crate::sketch_attachment_ui::clear(app);
         app.session.replace_design(session);
+        app.sketch_last_views = Default::default();
         give_up_renames_of_other_designs(app);
         reset_chat(app);
         // Another design in the tab: what waits for the blank one's tab no longer does.
@@ -2356,13 +2443,16 @@ pub fn close(app: &mut SolveApp, i: usize, force: bool) {
         app.tool = None;
         app.bom = None;
         app.session.replace_design(Session::default());
+        app.sketch_last_views = Default::default();
         give_up_renames_of_other_designs(app);
         app.session.revision = rev + 1;
         crate::prefs::apply_new_design(app);
         app.cam = Camera::default();
         app.fit_view();
         put_view(app, DocView::default());
-        app.docs = Documents::default();
+        // The remembered views stay where they are kept, the closed design's just added.
+        let view_memory = std::mem::take(&mut app.docs.view_memory);
+        app.docs = Documents { view_memory, ..Documents::default() };
         app.edit_in_place = Default::default();
         app.home.open = app.preferences.show_home_on_startup;
         crate::plugin_events::observe(app);
@@ -2965,6 +3055,7 @@ const TAB_HANDLES: crate::app_bar::TabHandles<'static> = crate::app_bar::TabHand
     view_new: "tab:view_new",
     view_more: "tab:view_more",
     switcher: "tab:switcher",
+    view_collapse: "tab:view_collapse",
     file_drop: "tab:file_drop",
 };
 
@@ -3224,7 +3315,10 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
                     place,
                     security: *security,
                     views,
+                    collapsed: false,
                 })
+                .enumerate()
+                .map(|(design, tab)| crate::app_bar::DocTab { collapsed: views_collapsed(app, design), ..tab })
                 .collect(),
             selected,
             shown_selected: (!app.home.open).then_some(selected),
@@ -3252,6 +3346,8 @@ pub fn tabs(app: &mut SolveApp, ui: &mut egui::Ui, r: Rect, x0: f32, x1: f32) {
                 new_view: solidcraft_ui_text::tr_label("Open another view"),
                 more: more_text,
                 switch_view: solidcraft_ui_text::tr("tab_strip.switch_view"),
+                collapse_views: solidcraft_ui_text::tr("tab_strip.collapse_views"),
+                expand_views: solidcraft_ui_text::tr("tab_strip.expand_views"),
             },
             view_menu: &view_menu,
             view_right_row: crate::design_view_ui::VIEW_CLOSE_RIGHT,
@@ -3720,11 +3816,11 @@ pub fn prompt(app: &mut SolveApp, ctx: &egui::Context) {
                                                 if name.clicked() {
                                                     show_tab = Some(*index);
                                                 }
-                                                let path = ui_kit::text(
-                                                    ui,
-                                                    session.path.as_deref().unwrap_or(solidcraft_ui_text::tr("document.not_saved_yet")),
-                                                    ui_kit::Text::Note("save_path"),
-                                                );
+                                                let shown = session
+                                                    .path
+                                                    .as_deref()
+                                                    .map_or_else(|| solidcraft_ui_text::tr("document.not_saved_yet"), crate::display_user_path);
+                                                let path = ui_kit::text(ui, shown, ui_kit::Text::Note("save_path"));
                                                 crate::scenario::publish_rect(&format!("save_many:path:{index}"), path.rect);
                                             });
                                         });
@@ -6373,6 +6469,69 @@ mod tests {
         assert_eq!(views.active().spec.unwrap().camera.yaw, 1.7);
     }
 
+    /// #23271: with "Reopen a design's views next time it opens" on, a design closed and opened
+    /// again from its file shows exactly the camera it was closed with: the direction, the zoom
+    /// and the centre, also in a new session, where the app frames its first view as the design
+    /// comes in. On the desktop the views are kept in a folder; in the browser the page
+    /// keeps them in memory for the browser's storage, and closing the last design must not
+    /// lose them.
+    #[test]
+    fn a_design_opened_again_shows_the_camera_it_was_closed_with() {
+        // How the design opens: the window's own open (the desktop, and the browser's files window
+        // for a design), `doc.open` run as a command (the browser's programs), or read here and now
+        // (`open_path_with`: the browser's files that aren't designs).
+        for (browser, open) in [(false, "window"), (true, "window"), (true, "command"), (true, "here")] {
+            let mut h = crate::scenario::Harness::new();
+            h.app.home.open = false;
+            h.app.preferences.design_reopen_views = true;
+            if browser {
+                use_host_view_memory(&mut h.app, None);
+            } else {
+                h.app.docs.view_memory = crate::view_memory::Store::Folder(h.dir.join("view-memory"));
+            }
+            h.app.run("solid.box", json!({"length": 40, "width": 30, "height": 20})).unwrap();
+            let path = h.dir.join("closed.sc").to_string_lossy().into_owned();
+            h.app.run("file.save_as", json!({"path": path})).unwrap();
+            h.settle();
+            let camera = Camera { yaw: 2.3, pitch: 0.25, distance: 150.0, target: solidcore_record::Vec3::new(5.0, -3.0, 8.0), ..h.app.cam };
+            h.app.cam = camera;
+            h.frames(2);
+            close(&mut h.app, 0, false);
+            crate::view_memory::wait_for_pending().unwrap();
+            h.settle();
+            assert_ne!(h.app.session.path.as_deref(), Some(path.as_str()), "closed");
+            assert_eq!(view_memory_changed(&h.app), browser, "the browser's page has views to keep");
+            // As in a new session: the app frames its first view in the frame the design lands in.
+            match open {
+                "command" => {
+                    h.app.fitted = false;
+                    crate::control::execute(&mut h.app, "doc.open", json!({"path": path})).unwrap();
+                }
+                "here" => {
+                    h.app.fitted = false;
+                    h.app.open_path_with(&path, &Default::default()).unwrap();
+                }
+                _ => h.app.open_path_async(&path),
+            }
+            for _ in 0..2000 {
+                if h.app.session.path.as_deref() == Some(path.as_str()) {
+                    break;
+                }
+                h.app.fitted = false;
+                h.frame();
+            }
+            h.settle();
+            h.frames(3);
+            assert_eq!(h.app.session.path.as_deref(), Some(path.as_str()), "opened again");
+            let shown = h.app.cam;
+            assert_eq!(
+                (shown.yaw, shown.pitch, shown.distance, shown.target),
+                (camera.yaw, camera.pitch, camera.distance, camera.target),
+                "browser: {browser}, open: {open}"
+            );
+        }
+    }
+
     #[test]
     fn remembered_background_views_apply_their_camera_when_first_shown() {
         let mut h = crate::scenario::Harness::new();
@@ -6619,6 +6778,7 @@ mod tests {
         crate::view_memory::wait_for_pending().unwrap();
         assert!(!dir.exists(), "off: nothing is kept");
         h.app.preferences.design_reopen_views = true;
+        view_collapse(&mut h.app, true);
         remember_views_in(&h.app, 0, &dir);
         crate::view_memory::wait_for_pending().unwrap();
         h.app.docs.views = ViewSet::new();
@@ -6630,6 +6790,7 @@ mod tests {
         let kinds: Vec<ViewKind> = h.app.docs.views.views().iter().map(|view| view.kind).collect();
         assert_eq!(kinds, [ViewKind::Model, ViewKind::Model], "the sheet has no workspace yet");
         assert_eq!(h.app.docs.views.active().kind, ViewKind::Model);
+        assert!(h.app.docs.views.collapsed(), "folded sub-tabs come back folded");
         // Legacy remembered Sketch tabs are removed without changing design features.
         let stale = json!({"views": [{"id": 7, "kind": "sketch", "name": "Sketch 1", "subject": "987654"}], "active": 7});
         crate::view_memory::remember(&dir, &path, stale).unwrap();
@@ -6638,6 +6799,47 @@ mod tests {
         assert_eq!(h.app.docs.views.active().kind, ViewKind::Model);
         assert!(h.app.session.doc.features.iter().any(|feature| feature.name == "Sketch1"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The chevron right after a design's + folds its sub-tabs into its tab and shows them again;
+    /// `tab.view.collapse` does the same (toggling without `collapsed`), `tab.view.list` says
+    /// which, a new view shows them again, and each design keeps its own.
+    #[test]
+    fn the_chevron_and_the_command_fold_a_designs_sub_tabs() {
+        let mut h = crate::scenario::Harness::new();
+        h.app.home.open = false;
+        h.app.custom_titlebar = true;
+        h.app.preferences.design_views_as_tabs = true;
+        h.call("ui.resize", json!({"width": 1400, "height": 720}));
+        let call =
+            |h: &mut crate::scenario::Harness, command: &str, params: Value| h.call("engine.execute", json!({"command": command, "params": params}));
+        assert_eq!(call(&mut h, "tab.view.open", json!({"kind": "animation"}))["ok"], true);
+        h.frames(2);
+        assert!(crate::scenario::rect_of("tab:view:1").is_some(), "the sub-tabs are shown");
+        h.step(&json!({"click": {"handle": "tab:view_collapse"}})).unwrap();
+        h.frames(2);
+        assert!(h.app.docs.views.collapsed());
+        assert!(crate::scenario::rect_of("tab:view:1").is_none(), "folded: no sub-tabs");
+        assert!(crate::scenario::rect_of("tab:view_collapse").is_some(), "the chevron stays to show them again");
+        assert_eq!(call(&mut h, "tab.view.list", json!({}))["result"]["collapsed"], true);
+        h.step(&json!({"click": {"handle": "tab:view_collapse"}})).unwrap();
+        h.frames(2);
+        assert!(!h.app.docs.views.collapsed() && crate::scenario::rect_of("tab:view:1").is_some(), "shown again");
+        // The command: toggling, then as asked.
+        assert_eq!(call(&mut h, "tab.view.collapse", json!({}))["result"]["collapsed"], true);
+        assert_eq!(call(&mut h, "tab.view.collapse", json!({"collapsed": true}))["result"]["collapsed"], true);
+        assert_eq!(call(&mut h, "tab.view.collapse", json!({"collapsed": false}))["result"]["collapsed"], false);
+        assert_eq!(call(&mut h, "tab.view.collapse", json!({"collapsed": "yes"}))["ok"], false);
+        // A view added shows them again.
+        call(&mut h, "tab.view.collapse", json!({"collapsed": true}));
+        call(&mut h, "tab.view.open", json!({"kind": "render"}));
+        assert!(!h.app.docs.views.collapsed(), "a new view shows the sub-tabs");
+        // Each design keeps its own: folding the first leaves the second as it was.
+        call(&mut h, "tab.view.collapse", json!({"collapsed": true}));
+        open_tab(&mut h.app, Session::default()).unwrap();
+        assert!(!views_collapsed(&h.app, 1));
+        switch(&mut h.app, 0);
+        assert!(views_collapsed(&h.app, 0) && !views_collapsed(&h.app, 1));
     }
 
     #[test]
@@ -7253,17 +7455,17 @@ mod tests {
         assert!(a.run("solid.box", json!({"length": 5, "width": 5, "height": 5})).is_err(), "a design adopted over a blank one");
     }
 
-    /// Hide Origin by Default hides the Origin of designs that don't keep its eye; a design that
+    /// The Origin visibility preference on Hidden hides the Origin of designs that don't keep its eye; a design that
     /// does keeps it, along with the rest of the browser's view, in its tab and in its file.
     #[test]
     fn the_browsers_view_follows_each_design_and_the_origin_preference() {
         let mut a = app();
         assert!(a.origin_shown());
-        a.preferences.hide_origin = true;
+        a.preferences.hide_origin = crate::prefs::OriginDisplay::Hidden;
         assert!(!a.origin_shown() && !a.session.is_dirty(), "the preference is not a change to the design");
         let mut b = app();
         b.load_prefs(&a.prefs());
-        assert!(b.preferences.hide_origin && !b.origin_shown(), "the preference is kept between runs");
+        assert!(b.preferences.hide_origin == crate::prefs::OriginDisplay::Hidden && !b.origin_shown(), "the preference is kept between runs");
         // This design shows its Origin and locks its body and hides its Sketches folder.
         a.run("solid.box", json!({"length": 10, "width": 10, "height": 10})).unwrap();
         a.set_origin_shown(true);
@@ -7276,9 +7478,60 @@ mod tests {
         // Opened again, the design's own Origin setting wins over the preference.
         let text = a.session.design().to_json();
         let mut c = app();
-        c.preferences.hide_origin = true;
+        c.preferences.hide_origin = crate::prefs::OriginDisplay::Hidden;
         c.session = Session::new(solidcraft_engine::doc::Document::from_json(&text).unwrap());
         assert!(c.origin_shown() && c.session.visibility == a.session.visibility);
+    }
+
+    /// The Origin visibility preference on Automatic: the Origin shows until the design has a body, and
+    /// again when the body is undone or rolled back. It saves nothing in the design, the Browser's
+    /// eye wins over it, and each design decides by its own bodies.
+    #[test]
+    fn an_automatic_origin_hides_once_the_design_has_a_body() {
+        let mut a = app();
+        a.preferences.hide_origin = crate::prefs::OriginDisplay::Automatic;
+        assert!(a.origin_shown(), "an empty design shows it");
+        a.run("sketch.create", json!({"plane": "XY"})).unwrap();
+        a.run("sketch.rectangle.two_point", json!({"p0": [0, 0], "p1": [20, 10]})).unwrap();
+        a.run("sketch.finish", json!({})).unwrap();
+        assert!(a.origin_shown(), "a sketch is not a body");
+        a.run("solid.box", json!({"length": 10, "width": 10, "height": 10})).unwrap();
+        assert!(!a.origin_shown(), "the first body hides it");
+        assert!(crate::viewport::origin_planes(&a).is_empty() && crate::viewport::origin_axes(&a).is_empty());
+        assert!(a.session.visibility.is_empty(), "nothing is saved in the design");
+        a.start("sketch.create");
+        assert_eq!(crate::viewport::origin_planes(&a).len(), 3, "Create Sketch still offers the planes");
+        a.dialog = None;
+        a.session.visibility.hidden_bodies.push("Body1".into());
+        assert!(!a.origin_shown(), "hiding the body does not bring it back");
+        a.session.visibility.hidden_bodies.clear();
+        let body = a.session.doc.features.last().unwrap().id;
+        a.edit_feature(body);
+        assert!(a.dialog.is_some() && a.session.model.state().bodies.is_empty(), "the edit rolls back before the body");
+        assert!(!a.origin_shown(), "editing the first body leaves it hidden");
+        crate::dialogs::cancel(&mut a);
+        assert!(!a.origin_shown());
+        a.run("timeline.roll_to", json!({"position": 1})).unwrap();
+        assert!(a.origin_shown(), "rolled back before the body");
+        a.run("timeline.roll_to", json!({})).unwrap();
+        assert!(!a.origin_shown());
+        let mut undone = 0;
+        while !a.session.model.state().bodies.is_empty() && undone < 5 {
+            a.run("edit.undo", json!({})).unwrap();
+            undone += 1;
+        }
+        assert!(a.origin_shown(), "undoing the body shows it again");
+        a.run("edit.redo", json!({})).unwrap();
+        assert!(!a.origin_shown(), "redoing it hides it");
+        new_design(&mut a);
+        assert!(a.origin_shown(), "another design has no body yet");
+        switch(&mut a, 0);
+        assert!(!a.origin_shown());
+        a.set_origin_shown(true);
+        assert!(a.origin_shown(), "the Browser's eye wins");
+        let text = a.session.design().to_json();
+        a.session = Session::new(solidcraft_engine::doc::Document::from_json(&text).unwrap());
+        assert!(a.origin_shown(), "and the design keeps it");
     }
 
     /// #1205: Units of new designs apply to the empty design a launch shows, to New while that

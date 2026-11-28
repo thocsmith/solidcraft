@@ -121,7 +121,20 @@ pub(crate) fn smlib_body_ordered(body: &Body) -> Result<(solidcraft_smlib::Brep,
 /// consumes (solidcore#3359). An export or a failed-boolean check can edit its argument:
 /// run either on a disposable copy, including the numbering fallback for an incomplete import.
 pub(crate) fn smlib_operand_ordered(body: &Body) -> Result<(std::sync::Arc<solidcraft_smlib::Brep>, Option<solidcraft_smlib::history::Order>)> {
-    let brep = body.smlib()?;
+    operand_ordered(body, body.smlib()?)
+}
+
+/// [`smlib_operand_ordered`] for a boolean that consumes its operands: where the body keeps no
+/// SMLib form yet, the one made for the operation is not kept, so the boolean takes it over
+/// rather than copying it ([`Body::smlib_to_consume`]).
+pub(crate) fn smlib_operand_to_consume(body: &Body) -> Result<(std::sync::Arc<solidcraft_smlib::Brep>, Option<solidcraft_smlib::history::Order>)> {
+    operand_ordered(body, body.smlib_to_consume()?)
+}
+
+fn operand_ordered(
+    body: &Body,
+    brep: std::sync::Arc<solidcraft_smlib::Brep>,
+) -> Result<(std::sync::Arc<solidcraft_smlib::Brep>, Option<solidcraft_smlib::history::Order>)> {
     let _span = solidcraft_profile::span("kernel", "smlib_body");
     let record = body.record();
     if complete_record_import(record, &brep) {
@@ -383,8 +396,12 @@ mod tests {
         let extruded = crate::extrude(&Plane::XY, &[region], 0., 5.).unwrap().remove(0);
         assert!(extruded.face_sources().is_some_and(|s| s.iter().any(Option::is_some)), "an extrusion carries its face sources");
         assert!(cut.history().is_some(), "a cut carries its history");
-        let paint =
-            crate::Paint { opacity: 0.5, faces: vec![crate::FacePaint { face: 1, color: [0.9, 0.1, 0.2], opacity: 0.75, name: None }], name: None };
+        let paint = crate::Paint {
+            opacity: 0.5,
+            faces: vec![crate::FacePaint { face: 1, color: [0.9, 0.1, 0.2], opacity: 0.75, name: None }],
+            name: None,
+            layer: None,
+        };
         let painted = cube.clone().with_color(Some([0.1, 0.5, 0.9])).with_paint(Some(paint));
         let top = (0..cube.face_count()).find(|f| cube.planar_face(*f).is_some_and(|p| p.normal().z > 0.5 && p.origin.z > 9.)).unwrap();
         let split =
@@ -514,6 +531,7 @@ mod tests {
             opacity: 0.7,
             faces: vec![crate::FacePaint { face: 2, color: [0.25, 0.5, 0.75], opacity: 0.6, name: None }],
             name: None,
+            layer: None,
         }));
         body.splits = Some(Arc::new(vec![vec![Vec3::new(1., 2., 3.), Vec3::new(11., 2., 3.)]]));
         body.regularization_protected = true;

@@ -138,6 +138,28 @@ impl Brep {
         r
     }
 
+    /// [`Brep::boolean_tagged`] of operands each either read (`Ok`) or handed over by the caller,
+    /// who never reads it again (`Err`): a handed-over operand is tagged itself rather than a copy
+    /// of it, so the boolean skips that copy, and its result is the one [`Brep::boolean_tagged`]
+    /// gives. While a trace or a failure dump folder needs the operands as they came in, every
+    /// operand is read, as by [`Brep::boolean_tagged`].
+    pub fn boolean_tagged_owned(a: std::result::Result<&Brep, Brep>, b: std::result::Result<&Brep, Brep>, op: BooleanOp) -> Result<Option<Brep>> {
+        if trace::on() || core::dump::dumping() {
+            let a = match &a {
+                Ok(x) => *x,
+                Err(x) => x,
+            };
+            let b = match &b {
+                Ok(x) => *x,
+                Err(x) => x,
+            };
+            return a.boolean_tagged(b, op);
+        }
+        let a = a.map(Brep::core).map_err(|x| x.body);
+        let b = b.map(Brep::core).map_err(|x| x.body);
+        core::boolean::boolean_tagged_owned(a, b, op).map(|r| r.map(Brep::made_core))
+    }
+
     /// The union of `breps` in one call: they are unioned pairwise, level by level, so none takes
     /// part in more than about log2(n) unions. The result is as [`Brep::boolean`]'s; operands
     /// tagged each with its own number ([`Brep::tagged`]) give a result whose [`Brep::history`]
@@ -320,6 +342,29 @@ impl Brep {
             &[self],
             &r,
             || json!({"edge": trace::picks(self, PickKind::Edge, &[edge], tolerance), "start": start, "degree": degree, "knots": knots, "radii": radii}),
+        );
+        r
+    }
+
+    /// The edges nearest to `edges` (each within `tolerance`), one tangent chain, rounded in one
+    /// blend with the radius law of `degree`, `knots` and `radii` along the whole chain, 0 at its
+    /// end nearest `start`: each edge takes the part of the law its interval in the joined-curve parameterization
+    /// gives, scaled by endpoint-speed ratios so speed agrees at joints. Edges that are not one open chain are [`Error::Unported`], naming why.
+    pub fn fillet_variable_chain(
+        &self,
+        edges: &[[f64; 3]],
+        tolerance: f64,
+        start: [f64; 3],
+        degree: usize,
+        knots: &[f64],
+        radii: &[f64],
+    ) -> Result<Brep> {
+        let r = core::blend::fillet_variable_chain(self.core(), edges, tolerance, start, degree, knots, radii).map(Brep::made_core);
+        trace::made(
+            "fillet_variable_chain",
+            &[self],
+            &r,
+            || json!({"edges": trace::picks(self, PickKind::Edge, edges, tolerance), "start": start, "degree": degree, "knots": knots, "radii": radii}),
         );
         r
     }

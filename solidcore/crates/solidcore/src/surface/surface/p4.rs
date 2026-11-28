@@ -1939,6 +1939,10 @@ impl Surface {
                     num_objects: s.num_objects,
                     objects: [None; MAX_TREES],
                     nodes: s.nodes,
+                    contact: s.contact,
+                    unique: s.unique,
+                    shared_contact: s.shared_contact,
+                    limit_root: s.limit_root,
                 });
             }
             out

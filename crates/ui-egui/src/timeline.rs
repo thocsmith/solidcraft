@@ -335,12 +335,14 @@ pub(crate) fn icon_of(k: &FeatureKind) -> &'static str {
         FeatureKind::Revolve { .. } => "revolve",
         FeatureKind::Fillet { .. } => "fillet",
         FeatureKind::Chamfer { .. } => "chamfer",
+        FeatureKind::Dogbone { .. } => "dogbone",
         FeatureKind::Box { .. } => "box",
         FeatureKind::Cylinder { .. } => "cylinder",
         FeatureKind::Sphere { .. } => "sphere",
         FeatureKind::Torus { .. } => "torus",
         FeatureKind::Cone { .. } => "cone",
         FeatureKind::Combine { .. } => "combine",
+        FeatureKind::FingerJoint { .. } => "finger_joint",
         FeatureKind::Pattern { pattern: solidcraft_engine::doc::PatternKind::Rectangular { .. }, .. } => "pattern_rect",
         FeatureKind::Pattern { pattern: solidcraft_engine::doc::PatternKind::Path { .. }, .. } => "pattern_path",
         FeatureKind::Pattern { .. } => "pattern_circ",
@@ -362,6 +364,7 @@ pub(crate) fn icon_of(k: &FeatureKind) -> &'static str {
             PointDef::AlongPath { .. } => "point_along_path",
             PointDef::Average { .. } => "c_midpoint",
         },
+        FeatureKind::Hole { hardware: Some(_), .. } => "press_in_hardware",
         FeatureKind::Hole { .. } => "hole",
         FeatureKind::Loft { .. } => "loft",
         FeatureKind::Sweep { .. } => "sweep",
@@ -395,6 +398,7 @@ pub(crate) fn icon_of(k: &FeatureKind) -> &'static str {
         FeatureKind::Coil { .. } => "coil",
         FeatureKind::SheetPerforate { .. } => "perforate",
         FeatureKind::CellGrid { .. } => "perforate",
+        FeatureKind::ShaftSpline { .. } => "shaft_spline",
         FeatureKind::SheetBead { .. } => "rib",
         FeatureKind::BoundaryFill { .. } => "boundary_fill",
         FeatureKind::Patch { .. } => "surface_patch",
@@ -629,14 +633,15 @@ fn features_from(app: &SolveApp, from: usize, shown: Option<&[usize]>) -> Vec<u6
 /// ones when the timeline is filtered to a component, with the entry's label, for one delete
 /// through [`delete_features`] so the confirmation still lists what would fail. Not offered
 /// before the marker, nor when the menu acts on several selected features: an entry that acts
-/// partly on the selection and partly beyond it is hard to read.
+/// partly on the selection and partly beyond it is hard to read. Nor when the feature itself is
+/// all it would delete: Delete beside it does the same (#23191).
 fn after_marker(app: &SolveApp, id: u64, index: usize, marker: usize, shown: Option<&[usize]>) -> Option<(String, Vec<u64>)> {
     if index < marker || menu_targets(app, id).len() > 1 {
         return None;
     }
     let ids = features_from(app, marker, shown);
     // A feature the bar's filter leaves out has nothing shown after the marker to delete.
-    if ids.is_empty() {
+    if ids.is_empty() || ids == [id] {
         return None;
     }
     let key = if ids.len() == 1 { "timeline.delete_after_marker_one" } else { "timeline.delete_after_marker_other" };
@@ -2082,6 +2087,7 @@ mod tests {
             ("surface.fair", json!({"type":"surface_fair", "body":"A", "tolerance":"0.001"})),
             ("solid.rib", json!({"type":"rib", "sketch":0, "curves":[], "thickness":"2"})),
             ("solid.web", json!({"type":"rib", "sketch":0, "curves":[], "thickness":"2", "web":true})),
+            ("solid.finger_joint", json!({"type":"finger_joint", "bodies":["A","B"], "count":3, "clearance":"0"})),
         ];
         for (id, definition) in cases {
             let feature: solidcraft_engine::doc::FeatureKind = serde_json::from_value(definition).unwrap();
@@ -2099,9 +2105,12 @@ mod tests {
             placements: Vec::new(),
             components: Vec::new(),
             occurrences: Vec::new(),
+            join: false,
             pattern: PatternKind::Path {
                 path_sketch: solidcraft_engine::doc::SketchId(0),
                 path: Vec::new(),
+                path_body: None,
+                path_edges: Vec::new(),
                 count: "2".into(),
                 spacing: "10".into(),
                 extent: false,
