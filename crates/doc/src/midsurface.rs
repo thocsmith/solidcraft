@@ -4,7 +4,9 @@
 //! says why every other face is in no pair; a caller (a person, an agent, or [`confident`]) then
 //! chooses the pairs, and [`sheets`] and [`surface_body`] build them.
 //!
-//! Flat walls (two planes) and round walls (two coaxial cylinders) pair. Every decision is made on
+//! Flat walls (two planes), drafted walls (two planes tilted apart by up to
+//! [`MAX_DRAFT_DEGREES`], their sheet on the bisector) and round walls (two coaxial cylinders)
+//! pair. Every decision is made on
 //! the exact faces: the overlap is an exact region boolean, "is anything in between?" an exact
 //! ray, a rim's width the exact points of its edges against the wall (solidcore's
 //! `mid_sheet::wall_holds`). The geometry itself (facing faces, joints, areas, projections) is
@@ -15,7 +17,8 @@ use solidcore_record::brep::Loop as Bounds;
 use solidcore_record::{Loop2, Plane, Region2, Seg2, Vec2, Vec3};
 use solidcraft_geom::prelude::*;
 use solidcraft_kernel::services::face_pair::{
-    CylinderFace, OutwardPlane, axial_range_in, facing_cylinders, facing_planes, material_toward_axis, round_directions,
+    CylinderFace, DraftedPlanes, OutwardPlane, axial_range_in, drafted_planes, drafted_thickness, facing_cylinders, facing_planes, inset,
+    material_toward_axis, round_directions,
 };
 use solidcraft_kernel::services::mid_joint::{move_edge_onto_line, planes_meeting};
 use solidcraft_kernel::services::mid_sheet::{self as ms, Frame, Wall};
@@ -27,6 +30,18 @@ use solidcraft_develop::Query;
 
 /// The most faces a body may have to be analysed.
 pub const MAX_FACES: usize = 20_000;
+
+/// The largest draft (degrees) between a wall's two planar faces that pairs: a moulded or cast
+/// wall's sides are drafted a few degrees, and a wall whose sides lean further apart is a taper
+/// or a wedge a shell of one thickness models poorly. Two faces facing each other across material
+/// within the thickness limits but tilted further apart are left unpaired, as
+/// [`Reason::Steep`]. Faces parallel within the kernel's angular tolerance (half a degree) are a
+/// flat wall.
+pub const MAX_DRAFT_DEGREES: f64 = 10.0;
+
+/// Past this draft (degrees) two planar faces are not looked at as a wall at all, not even to
+/// report them steep: they are a chamfer, a slope or a corner, not a wall's two sides.
+const STEEP_LOOK_DEGREES: f64 = 45.0;
 
 /// What to look for.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -65,13 +80,24 @@ pub struct Pair {
     /// A point inside each face (on it, off its edges): how a design stores the pair, so that a
     /// rebuild finds the same faces without pairing again.
     pub points: [[f64; 3]; 2],
-    /// Distance between the faces (mm): the shell's thickness.
+    /// Distance between the faces (mm): the shell's thickness. For a drafted wall, its mean over
+    /// the sheet (the thickness at the sheet's centroid: it varies linearly across the sheet).
     pub thickness: f64,
+    /// The thinnest and the thickest the wall is over the sheet (mm): both `thickness` for a flat
+    /// or round wall; for a drafted wall, at the sheet's corners nearest and farthest from the line
+    /// the two planes meet in. The thickness limits take the wall when both lie within them.
+    pub thinnest: f64,
+    /// See `thinnest`.
+    pub thickest: f64,
+    /// The angle between the two faces (degrees): 0 for a flat or round wall, up to
+    /// [`MAX_DRAFT_DEGREES`] for a drafted one.
+    pub draft: f64,
     /// Area of the sheet the pair gives before its joints are made (mm²).
     pub overlap_area: f64,
     /// Share of the smaller face the overlap covers (0…1).
     pub coverage: f64,
-    /// Square root of the overlap area over the thickness: how thin the wall is for its size.
+    /// Square root of the overlap area over the thickness (the thickest, for a drafted wall): how
+    /// thin the wall is for its size.
     pub aspect: f64,
     /// [`Confidence::High`]: nothing in the evidence needs a decision, and [`confident`] builds
     /// it. [`Confidence::Review`]: `notes` say what needs a decision; it is built only when a
@@ -82,9 +108,11 @@ pub struct Pair {
     /// Area of openings in only one of the two faces (a boss's foot, a blind pocket's mouth)
     /// that the sheet is filled over (mm²): the material there is not this wall's to model.
     pub filled_over: f64,
-    /// The plane halfway between the faces, its normal toward the first face.
+    /// The plane halfway between the faces, its normal toward the first face (a drafted wall's
+    /// bisector).
     mid: OutwardPlane,
-    /// The first face's plane frame, and its outward normal: what `shared` is read in.
+    /// The first face's plane frame (a drafted wall's: the bisector's), and the first face's
+    /// outward normal: what `shared` is read in.
     frame: Plane,
     out: Vec3,
     /// What the sheet covers, in `frame`'s coordinates.
@@ -125,6 +153,10 @@ pub enum Reason {
     /// A face looks back at it within the thickness limits (`gap` mm away), but the two share no
     /// area seen across the wall: their outlines do not overlap.
     NoOverlap { gap: f64 },
+    /// A planar face looks back at it across material within the thickness limits and the two
+    /// overlap, but they are tilted `draft` degrees apart, past [`MAX_DRAFT_DEGREES`]: a taper,
+    /// not a drafted wall. `gap` is the wall's thinnest (mm).
+    Steep { draft: f64, gap: f64 },
     /// Nothing looks back at it.
     NoFacingFace,
     /// The thin end of a wall: it borders the pairs listed (indices into [`Analysis::pairs`]) and
@@ -182,6 +214,9 @@ struct Nearest {
     too_thin: Option<f64>,
     too_far: Option<f64>,
     no_overlap: Option<f64>,
+    /// The least steep face looking back past the largest draft: its draft and the wall's
+    /// thinnest.
+    steep: Option<(f64, f64)>,
 }
 
 fn nearer(slot: &mut Option<f64>, gap: f64) {
@@ -487,6 +522,9 @@ fn round_pair(
         faces,
         points: [pa, pb],
         thickness,
+        thinnest: thickness,
+        thickest: thickness,
+        draft: 0.0,
         overlap_area,
         coverage,
         aspect,
@@ -559,8 +597,19 @@ pub fn analyze(body: &Body, opts: &Options) -> Result<Analysis> {
     let mut pairs: Vec<Pair> = Vec::new();
     let mut nearest: Vec<Nearest> = vec![Nearest::default(); n];
     let mut beyond: Option<f64> = None;
-    // Records, for faces `f` and `g`, a face looking back `gap` away that made no pair.
-    let mut missed = |f: usize, g: usize, gap: f64| {
+    // Records, for faces `f` and `g`, a face looking back `gap` away that made no pair: tilted
+    // `steep` degrees apart, past the largest draft, when that is why.
+    let mut missed = |f: usize, g: usize, gap: f64, steep: Option<f64>| {
+        if let Some(draft) = steep {
+            for slot in [f, g] {
+                if let Some(near) = nearest.get_mut(slot)
+                    && near.steep.is_none_or(|(d, _)| draft < d)
+                {
+                    near.steep = Some((draft, gap));
+                }
+            }
+            return;
+        }
         if gap > opts.max_thickness + tol {
             nearer(&mut beyond, gap);
         }
@@ -585,16 +634,29 @@ pub fn analyze(body: &Body, opts: &Options) -> Result<Analysis> {
             // how far apart they are.
             // The message is made only on an error: this runs for every two flat faces.
             let facing = facing_planes(&outward(a), &outward(b)).map_err(|e| ops_err(&format!("faces {f} and {g}"))(e))?;
-            let Some(facing) = facing else { continue };
+            let Some(facing) = facing else {
+                // Not parallel: a drafted wall when the kernel finds the two leaning apart, by less
+                // than a chamfer does.
+                let drafted = drafted_planes(&outward(a), &outward(b)).map_err(|e| ops_err(&format!("faces {f} and {g}"))(e))?;
+                if let Some(d) = drafted.filter(|d| d.draft_degrees < STEEP_LOOK_DEGREES) {
+                    match drafted_pair(&look, [f, g], a, b, &d)? {
+                        Drafted::Pair(p) => pairs.push(*p),
+                        Drafted::Missed(gap) => missed(f, g, gap, None),
+                        Drafted::Steep { draft, gap } => missed(f, g, gap, Some(draft)),
+                        Drafted::NoWall => {}
+                    }
+                }
+                continue;
+            };
             let gap = facing.thickness;
             if gap < opts.min_thickness - tol || gap > opts.max_thickness + tol {
-                missed(f, g, gap);
+                missed(f, g, gap, None);
                 continue;
             }
             let mid = OutwardPlane { point: facing.mid_point, outward: facing.toward_first };
             match pair_of(&look, [f, g], a, b, gap, mid)? {
                 Some(p) => pairs.push(p),
-                None => missed(f, g, gap),
+                None => missed(f, g, gap, None),
             }
         }
     }
@@ -607,12 +669,12 @@ pub fn analyze(body: &Body, opts: &Options) -> Result<Analysis> {
             let facing = facing_cylinders(&a.cylinder, &b.cylinder).map_err(|e| ops_err(&format!("faces {f} and {g}"))(e))?;
             let Some(facing) = facing else { continue };
             if facing.thickness < opts.min_thickness - tol || facing.thickness > opts.max_thickness + tol {
-                missed(f, g, facing.thickness);
+                missed(f, g, facing.thickness, None);
                 continue;
             }
             match round_pair(&look, &rounds, [f, g], a, b, facing.thickness, facing.mid_radius)? {
                 Some(p) => pairs.push(p),
-                None => missed(f, g, facing.thickness),
+                None => missed(f, g, facing.thickness, None),
             }
         }
     }
@@ -628,9 +690,10 @@ pub fn analyze(body: &Body, opts: &Options) -> Result<Analysis> {
         } else if flat.is_none() && round.is_none() {
             Reason::NotPlanar
         } else {
-            // Within the limits but sharing nothing says most; then too far, then too thin.
+            // Within the limits but sharing nothing says most; then too steep, too far, too thin.
             match nearest.get(face).copied().unwrap_or_default() {
                 Nearest { no_overlap: Some(gap), .. } => Reason::NoOverlap { gap },
+                Nearest { steep: Some((draft, gap)), .. } => Reason::Steep { draft, gap },
                 Nearest { too_far: Some(gap), .. } => Reason::OutOfRange { gap },
                 Nearest { too_thin: Some(gap), .. } => Reason::TooThin { gap },
                 Nearest { .. } => Reason::NoFacingFace,
@@ -816,9 +879,15 @@ fn edge_between(samples: &[[f64; 3]], a: &Flat, mid: &OutwardPlane, gap: f64, sh
     let [x, y, z] = mid.outward;
     let halves =
         [Wall::Flat { face: *mid, thickness: half }, Wall::Flat { face: OutwardPlane { point: mid.point, outward: [-x, -y, -z] }, thickness: half }];
-    let frame = frame_of(&a.plane);
+    edge_inside(samples, &a.plane, &halves, shared, margin)
+}
+
+/// The first of `samples` that lies in one of `walls` (the kernel's test, no slack) and well
+/// inside `shared` (read in `frame`), `margin` from its edges.
+fn edge_inside(samples: &[[f64; 3]], frame: &Plane, walls: &[Wall], shared: &[Region2], margin: f64) -> Option<[f64; 3]> {
+    let frame = frame_of(frame);
     samples.iter().copied().find(|s| {
-        let inside = halves.iter().any(|w| ms::wall_holds(w, std::slice::from_ref(s), 0.0).unwrap_or(false));
+        let inside = walls.iter().any(|w| ms::wall_holds(w, std::slice::from_ref(s), 0.0).unwrap_or(false));
         if !inside {
             return false;
         }
@@ -921,6 +990,9 @@ fn pair_of(look: &Look, faces: [usize; 2], a: &Flat, b: &Flat, gap: f64, mid: Ou
         faces,
         points: [pa, pb],
         thickness: gap,
+        thinnest: gap,
+        thickest: gap,
+        draft: 0.0,
         overlap_area,
         coverage,
         aspect,
@@ -934,6 +1006,198 @@ fn pair_of(look: &Look, faces: [usize; 2], a: &Flat, b: &Flat, gap: f64, mid: Ou
         wall,
         round: None,
     }))
+}
+
+/// What two drafted planar faces gave.
+enum Drafted {
+    /// A drafted wall.
+    Pair(Box<Pair>),
+    /// They overlap across material, but the wall's thinnest or thickest lies past the limits, or
+    /// they share no area: as a flat wall's miss, at that thickness (mm).
+    Missed(f64),
+    /// A wall within the limits, but its faces lean further apart than [`MAX_DRAFT_DEGREES`].
+    Steep { draft: f64, gap: f64 },
+    /// No wall: air between them, or the two cross where they overlap.
+    NoWall,
+}
+
+/// The drafted wall of `a` (face `faces[0]`) and `b`, two planes tilted apart (`d`, the kernel's
+/// bisector). As [`pair_of`] for a flat wall, but both faces are read on the bisector, where the
+/// sheet lies: what their outlines share, less the openings through both, is the sheet. The
+/// kernel gives the wall's thickness at each corner of it; the wall is one only where that is
+/// positive everywhere (the material lies between the faces all over the sheet).
+fn drafted_pair(look: &Look, faces: [usize; 2], a: &Flat, b: &Flat, d: &DraftedPlanes) -> Result<Drafted> {
+    let Look { body, q, opts, tol, samples } = *look;
+    let what = format!("faces {} and {}", faces[0], faces[1]);
+    let (pa, pb) = (outward(a), outward(b));
+    let thick = |points: &[[f64; 3]]| drafted_thickness(&pa, &pb, points).map_err(ops_err(&what));
+    // A first look, at the first face's own inner point: past three times the limit there, or
+    // with no material behind it, no closer look is worth the region booleans.
+    let Some(seen_at) = inside_point(body, q, faces[0], Some(a), None, tol) else { return Ok(Drafted::NoWall) };
+    let first_look = thick(&[seen_at])?.first().copied().unwrap_or(0.0);
+    if first_look <= tol {
+        return Ok(Drafted::NoWall);
+    }
+    if first_look > opts.max_thickness * 3.0 + tol {
+        return Ok(Drafted::Missed(first_look));
+    }
+    let plane = Plane { origin: vec3(d.bisector.point), x: vec3(d.x), y: vec3(d.y) };
+    let frame = frame_of(&plane);
+    let (Some(ra), Some(rb)) = (face_region(body, q, &plane, a.out, faces[0], tol), face_region(body, q, &plane, b.out, faces[1], tol)) else {
+        return Ok(Drafted::NoWall);
+    };
+    let slack = tol.clamp(1e-9, 1e-4);
+    let boolean = |x: &[Region2], y: &[Region2], op: BoolOp| {
+        planar_regions_boolean(x, y, op, slack).map_err(|e| DocError::Invalid(format!("midsurface: overlap of {what}: {e}")))
+    };
+    let thickness_at = |p: Vec2| -> Result<f64> {
+        let on = ms::from_frame(&frame, [p.x, p.y]).map_err(ops_err(&what))?;
+        Ok(thick(&[on])?.first().copied().unwrap_or(0.0))
+    };
+    // The first face (not the pair's own) the kernel's exact rays from the bisector at `p` (in its
+    // frame) meet before either face is reached, along its normal both ways: its distance from the
+    // bisector and its index, or the face it could not test.
+    let between = |p: Vec2| -> Result<std::result::Result<Option<(f64, usize)>, usize>> {
+        let on = ms::from_frame(&frame, [p.x, p.y]).map_err(ops_err(&what))?;
+        let half = thick(&[on])?.first().copied().unwrap_or(0.0) * 0.5;
+        for way in [vec3(d.bisector.outward), -vec3(d.bisector.outward)] {
+            let hits = match q.ray(vec3(on), way, tol.max(1e-6)) {
+                Ok(h) => h,
+                Err(f) => return Ok(Err(f)),
+            };
+            if let Some((s, f, _)) = hits.iter().find(|(s, f, _)| *s > tol && *s < half - tol && !faces.contains(f)) {
+                return Ok(Ok(Some((*s, *f))));
+            }
+        }
+        Ok(Ok(None))
+    };
+    let mut notes = Vec::new();
+    let outline = boolean(&[filled(&ra)], &[filled(&rb)], BoolOp::Intersect)?;
+    if outline.iter().map(Region2::area).sum::<f64>() <= tol * tol {
+        return Ok(Drafted::Missed(first_look));
+    }
+    // The wall's thickness at every corner of what the two share (an arc's points too): linear
+    // across the bisector, so its least and greatest are there.
+    let mut corners = Vec::new();
+    for r in &outline {
+        for p in r.outer.polyline(tol).iter() {
+            corners.push(ms::from_frame(&frame, [p.x, p.y]).map_err(ops_err(&what))?);
+        }
+    }
+    let at_corners = thick(&corners)?;
+    let thinnest = at_corners.iter().copied().fold(f64::INFINITY, f64::min);
+    let thickest = at_corners.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    if !(thinnest.is_finite() && thickest.is_finite()) || thickest <= tol {
+        return Ok(Drafted::NoWall);
+    }
+    // The two faces cross inside what they share: no wall there. Meeting at a sharp edge of the
+    // wall (a knife edge) is a wall down to nothing.
+    if thinnest < -tol {
+        return Ok(Drafted::NoWall);
+    }
+    let thinnest = thinnest.max(0.0);
+    if thinnest < opts.min_thickness - tol {
+        return Ok(Drafted::Missed(thinnest));
+    }
+    if thickest > opts.max_thickness + tol {
+        return Ok(Drafted::Missed(thickest));
+    }
+    if d.draft_degrees > MAX_DRAFT_DEGREES {
+        return Ok(Drafted::Steep { draft: d.draft_degrees, gap: thinnest });
+    }
+    let (holes_a, holes_b) = (openings(&ra), openings(&rb));
+    let mouths = if holes_a.is_empty() || holes_b.is_empty() { Vec::new() } else { boolean(&holes_a, &holes_b, BoolOp::Intersect)? };
+    // Inside the wall, `margin` from both faces: the kernel's wedge between them, each face moved
+    // in.
+    let margin = (tol * 100.0).min(thickest * 0.25);
+    let inner = [Wall::Drafted { first: inset(&pa, margin).map_err(ops_err(&what))?, second: inset(&pb, margin).map_err(ops_err(&what))? }];
+    // As for a flat wall: an opening through both faces is a hole only where nothing lies between
+    // them along the bisector's normal, and no edge of the body stands inside its mouth.
+    let mut through = Vec::new();
+    for r in mouths {
+        match between(r.interior_point())? {
+            Ok(None) => match edge_inside(samples, &plane, &inner, std::slice::from_ref(&r), margin) {
+                None => through.push(r),
+                Some(at) => notes.push(format!(
+                    "stepped: an opening through faces {} and {} narrows between them (an edge of the body at ({:.3}, {:.3}, {:.3})); it is filled over, not cut out",
+                    faces[0], faces[1], at[0], at[1], at[2]
+                )),
+            },
+            Ok(Some(_)) => {}
+            Err(f) => notes.push(format!("unchecked: face {f} could not be tested exactly for whether an opening goes through; it is filled over")),
+        }
+    }
+    let shared = if through.is_empty() { outline } else { boolean(&outline, &through, BoolOp::Cut)? };
+    let overlap_area: f64 = shared.iter().map(Region2::area).sum();
+    if overlap_area <= tol * tol {
+        return Ok(Drafted::Missed(thinnest));
+    }
+    // Linear across the sheet: its mean is its value at the sheet's centroid, each piece's
+    // weighed by its area.
+    let mut weighed = 0.0;
+    for r in &shared {
+        weighed += thickness_at(r.centroid())? * r.area();
+    }
+    let thickness = (weighed / overlap_area).clamp(thinnest, thickest);
+    let exact: f64 = boolean(std::slice::from_ref(&ra), std::slice::from_ref(&rb), BoolOp::Intersect)?.iter().map(Region2::area).sum();
+    let filled_over = if overlap_area - exact > tol * tol { overlap_area - exact } else { 0.0 };
+    let smaller = ra.area().min(rb.area()).max(f64::MIN_POSITIVE);
+    let coverage = (exact / smaller).clamp(0.0, 1.0);
+    let aspect = overlap_area.sqrt() / thickest;
+    if aspect < opts.min_aspect {
+        notes.push(format!(
+            "chunky: spans about {:.1} times its thickest ({:.3} mm), below {:.1}; a shell may not represent it",
+            aspect, thickest, opts.min_aspect
+        ));
+    }
+    if coverage < 0.5 {
+        notes.push(format!("partial: the faces overlap on only {:.0}% of the smaller one", coverage * 100.0));
+    }
+    let biggest = shared.iter().max_by(|x, y| x.area().total_cmp(&y.area()));
+    let mut blocked = false;
+    if let Some(r) = biggest {
+        match between(r.interior_point())? {
+            Ok(Some((s, f))) => {
+                blocked = true;
+                notes.push(format!(
+                    "blocked: face {f} lies {s:.3} mm from the plane halfway between faces {} and {}, inside the wall",
+                    faces[0], faces[1]
+                ));
+            }
+            Ok(None) => {}
+            Err(f) => notes.push(format!("unchecked: face {f} could not be tested for blocking exactly")),
+        }
+    }
+    if !blocked && let Some(at) = edge_inside(samples, &plane, &inner, &shared, margin) {
+        notes.push(format!(
+            "blocked: an edge of the body runs between faces {} and {} at ({:.3}, {:.3}, {:.3}), inside the wall the sheet would span",
+            faces[0], faces[1], at[0], at[1], at[2]
+        ));
+    }
+    let confidence = if notes.is_empty() { Confidence::High } else { Confidence::Review };
+    let point_b = face_region(body, q, &b.plane, b.out, faces[1], tol)
+        .and_then(|r| ms::from_frame(&frame_of(&b.plane), [r.interior_point().x, r.interior_point().y]).ok());
+    let (Some(point_b), point_a) = (point_b, seen_at) else { return Ok(Drafted::NoWall) };
+    Ok(Drafted::Pair(Box::new(Pair {
+        faces,
+        points: [point_a, point_b],
+        thickness,
+        thinnest,
+        thickest,
+        draft: d.draft_degrees,
+        overlap_area,
+        coverage,
+        aspect,
+        confidence,
+        notes,
+        filled_over,
+        mid: d.bisector,
+        frame: plane,
+        out: a.out,
+        shared,
+        wall: Wall::Drafted { first: pa, second: pb },
+        round: None,
+    })))
 }
 
 /// A mid-sheet: the part of the plane halfway between a pair of faces that the pair shares, as a
@@ -1098,6 +1362,12 @@ pub fn sheets_with(body: &Body, pairs: &[Pair], build: &Build) -> Result<Vec<She
             }
             if dropped > 0 {
                 notes.push(format!("{dropped} holes were filled over, as asked"));
+            }
+            if p.draft > 0.0 {
+                notes.push(format!(
+                    "a drafted wall ({:.2} degrees between its faces): {:.3} to {:.3} mm thick across the sheet, which carries its mean, {:.3} mm",
+                    p.draft, p.thinnest, p.thickest, p.thickness
+                ));
             }
             if p.filled_over > 0.0 {
                 notes.push(format!(
@@ -1346,6 +1616,10 @@ pub fn completeness(analysis: &Analysis, built: &[Pair]) -> Completeness {
             Some(Reason::NoOverlap { gap }) => {
                 c.reported.push((f, format!("its facing face is within the thickness limits but they do not overlap ({gap:.3} mm away)")));
             }
+            Some(Reason::Steep { draft, .. }) => c.reported.push((
+                f,
+                format!("its facing face leans past the largest draft a wall pairs across ({draft:.1} degrees, more than {MAX_DRAFT_DEGREES})"),
+            )),
             Some(Reason::NoFacingFace) => c.reported.push((f, "nothing faces it across material".to_string())),
             None => c.reported.push((f, "not analysed".to_string())),
         }
@@ -1356,9 +1630,9 @@ pub fn completeness(analysis: &Analysis, built: &[Pair]) -> Completeness {
 /// A wall thickness found among the confident pairs, and how much sheet it gives.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Cluster {
-    /// The thickness (mm): the smallest of the cluster's pairs.
+    /// The thickness (mm): the thinnest of the cluster's pairs (a drafted wall by its thinnest).
     pub thickness: f64,
-    /// The largest thickness in the cluster (mm).
+    /// The largest thickness in the cluster (mm), a drafted wall by its thickest.
     pub up_to: f64,
     /// The pairs' total overlap area (mm²).
     pub area: f64,
@@ -1377,17 +1651,20 @@ pub struct Cluster {
 /// one cluster: no limit could tell them apart.
 pub fn thickness_clusters(analysis: &Analysis) -> Vec<Cluster> {
     let slack = analysis.tolerance.max(0.0);
-    let mut ts: Vec<(f64, f64)> = analysis.pairs.iter().filter(|p| p.confidence == Confidence::High).map(|p| (p.thickness, p.overlap_area)).collect();
-    ts.sort_by(|a, b| a.0.total_cmp(&b.0));
+    // Each pair by its thinnest and thickest: one thickness for a flat or round wall, a range for a
+    // drafted one, all of which a limit must take.
+    let mut ts: Vec<(f64, f64, f64)> =
+        analysis.pairs.iter().filter(|p| p.confidence == Confidence::High).map(|p| (p.thinnest, p.thickest, p.overlap_area)).collect();
+    ts.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.total_cmp(&b.1)));
     let mut out: Vec<Cluster> = Vec::new();
-    for (t, area) in ts {
+    for (t, top, area) in ts {
         match out.last_mut() {
             Some(c) if t <= c.thickness * 1.01 + 1e-6 || t <= c.up_to + 2.0 * slack => {
-                c.up_to = t;
+                c.up_to = c.up_to.max(top);
                 c.area += area;
                 c.pairs += 1;
             }
-            _ => out.push(Cluster { thickness: t, up_to: t, area, pairs: 1, suggested_limit: 0.0 }),
+            _ => out.push(Cluster { thickness: t, up_to: top, area, pairs: 1, suggested_limit: 0.0 }),
         }
     }
     for c in &mut out {
@@ -1401,7 +1678,8 @@ pub fn thickness_clusters(analysis: &Analysis) -> Vec<Cluster> {
         let next = analysis
             .pairs
             .iter()
-            .map(|p| p.thickness)
+            // A limit leaves a pair out when it lies below the pair's thickest.
+            .map(|p| p.thickest)
             .chain(analysis.beyond)
             .filter(|t| *t > c.thickness * 1.01 + 1e-6 && *t > c.up_to + 2.0 * slack)
             .min_by(f64::total_cmp);
@@ -1427,8 +1705,9 @@ pub fn suggested_max_thickness(body: &Body) -> Result<Option<f64>> {
 }
 
 /// What a result leaves out or leaves to the analyst, in words: faces it does not cover, pairs
-/// that need a decision, sheets built though something lies between their faces, and sheets whose
-/// joints were not made. Empty when nothing is missing.
+/// that need a decision, sheets built though something lies between their faces, sheets whose
+/// joints were not made, and drafted walls' sheets, which carry their mean thickness. Empty when
+/// nothing is missing.
 pub fn report(analysis: &Analysis, sheets: &[Sheet]) -> Vec<String> {
     report_chosen(analysis, &[], sheets)
 }
@@ -1506,6 +1785,10 @@ pub fn report_chosen(analysis: &Analysis, chosen: &[Pair], sheets: &[Sheet]) -> 
         }
         for note in s.notes.iter().filter(|n| n.starts_with("a joint")) {
             out.push(format!("the sheet of faces {:?}: {note}", s.faces));
+        }
+        // A tapered wall's shell carries one thickness: the analyst decides whether that will do.
+        for note in s.notes.iter().filter(|n| n.starts_with("a drafted wall")) {
+            out.push(format!("the sheet of faces {:?} is {note}", s.faces));
         }
     }
     out
@@ -2113,7 +2396,7 @@ mod tests {
         let c = thickness_clusters(&a);
         assert!(c.len() == 1 && (c[0].suggested_limit - 3.0).abs() < 1e-9, "{c:?}");
         let plate = a.pairs[0].clone();
-        let review = |t: f64| Pair { thickness: t, confidence: Confidence::Review, ..plate.clone() };
+        let review = |t: f64| Pair { thickness: t, thinnest: t, thickest: t, confidence: Confidence::Review, ..plate.clone() };
         a.pairs.push(review(2.01));
         let c = thickness_clusters(&a);
         assert!(c.len() == 1 && (c[0].suggested_limit - 3.0).abs() < 1e-9, "{c:?}");
@@ -2637,5 +2920,164 @@ mod tests {
         let s = sheets(&part, &a.pairs).unwrap();
         let notes = report(&a, &s);
         assert!(notes.iter().any(|n| n.contains("meet at an angle")), "{notes:?}");
+    }
+
+    /// A plate 40 tall standing on XY, its profile a wedge: the face y = 0 and a face from (0, 2)
+    /// to (`len`, 2 + `len` tan `deg`), drafted `deg` against it.
+    fn wedge(len: f64, deg: f64) -> Body {
+        let rise = len * deg.to_radians().tan();
+        let pts = [Vec2::new(0.0, 0.0), Vec2::new(len, 0.0), Vec2::new(len, 2.0 + rise), Vec2::new(0.0, 2.0)];
+        extrude(&Plane::XY, &[Region2 { outer: Loop2::polygon(&pts), holes: vec![] }], 0.0, 40.0).unwrap().pop().unwrap()
+    }
+
+    #[test]
+    fn a_wedge_pairs_on_its_bisector_with_its_thinnest_and_thickest_sections() {
+        // Drafted d = 3 degrees, 60 long, 40 tall. The faces meet on the line x = -D, D = 2 / tan d.
+        // Along the bisector from that line, s, the wall is 2 s tan(d / 2) thick. The face y = 0
+        // reaches s from D c to (60 + D) c, c = cos(d / 2), and the drafted face from D c / cos d
+        // to (60 + D) c / cos d: they share D c / cos d to (60 + D) c.
+        let (len, deg) = (60.0, 3.0_f64);
+        let body = wedge(len, deg);
+        let a = analyze(&body, &opts(10.0)).unwrap();
+        assert_eq!(a.pairs.len(), 1, "{a:?}");
+        let p = &a.pairs[0];
+        let d = deg.to_radians();
+        let (big_d, c, h) = (2.0 / d.tan(), (d / 2.0).cos(), (d / 2.0).tan());
+        let (s0, s1) = (big_d * c / d.cos(), (len + big_d) * c);
+        assert!((p.draft - deg).abs() < 1e-9, "{p:?}");
+        assert!((p.thinnest - 2.0 * s0 * h).abs() < 1e-6, "{p:?}");
+        assert!((p.thickest - 2.0 * s1 * h).abs() < 1e-6, "{p:?}");
+        assert!((p.thickness - (s0 + s1) * h).abs() < 1e-6, "{p:?}");
+        assert!((p.overlap_area - 40.0 * (s1 - s0)).abs() < 1e-3, "{p:?}");
+        assert_eq!(p.confidence, Confidence::High, "{p:?}");
+        assert!((p.aspect - p.overlap_area.sqrt() / p.thickest).abs() < 1e-9);
+        // The two ends (x = 0 and 60) and the top and bottom (z = 0 and 40, the wedge's own
+        // profile) lie within the wedge: rims, all four.
+        assert_eq!(rims(&a), 4, "{a:?}");
+        assert_eq!(a.leftovers.len(), 4, "{a:?}");
+        let c = completeness(&a, &confident(&a));
+        assert!(c.accounts_for_every_face(), "{c:?}");
+        // The sheet lies on the bisector, its normal half the draft off the y axis, and carries
+        // the mean thickness and says the range.
+        let s = sheets(&body, &a.pairs).unwrap();
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!((area(&s[0].corners) - p.overlap_area).abs() < 1e-3, "{s:?}");
+        let n = s[0].normal;
+        assert!((n[2]).abs() < 1e-12 && (n[0].abs() - (d / 2.0).sin()).abs() < 1e-9, "{n:?}");
+        assert!((s[0].thickness - p.thickness).abs() < 1e-12);
+        assert!(s[0].notes.iter().any(|x| x.starts_with("a drafted wall")), "{s:?}");
+        let said = report(&a, &s);
+        assert_eq!(said.iter().filter(|n| n.contains("is a drafted wall (3.00 degrees between its faces)")).count(), 1, "{said:?}");
+        // Its corners are as far behind one face as behind the other.
+        let behind_bottom = |q: [f64; 3]| q[1];
+        let behind_top = |q: [f64; 3]| (2.0 + q[0] * d.tan() - q[1]) * d.cos();
+        for q in &s[0].corners {
+            assert!((behind_bottom(*q) - behind_top(*q)).abs() < 1e-9, "{q:?}");
+        }
+        assert!(surface_body(&s).is_ok());
+    }
+
+    #[test]
+    fn a_drafted_wall_is_held_to_the_thickness_limits_by_its_thickest_and_thinnest() {
+        // 60 long at 3 degrees: 2.0 thin to about 5.15 thick. A limit of 4 leaves it out.
+        let body = wedge(60.0, 3.0);
+        let a = analyze(&body, &opts(4.0)).unwrap();
+        assert!(a.pairs.is_empty(), "{a:?}");
+        assert!(a.leftovers.iter().any(|l| matches!(l.reason, Reason::OutOfRange { gap } if gap > 5.0)), "{a:?}");
+        let thin = Options { min_thickness: 2.5, ..opts(10.0) };
+        let a = analyze(&body, &thin).unwrap();
+        assert!(a.pairs.is_empty(), "{a:?}");
+        assert!(a.leftovers.iter().any(|l| matches!(l.reason, Reason::TooThin { gap } if gap < 2.5)), "{a:?}");
+        // The suggested limit takes the whole wall: its thickest, half as much again.
+        let a = analyze(&body, &opts(10.0)).unwrap();
+        let k = thickness_clusters(&a);
+        assert_eq!(k.len(), 1, "{k:?}");
+        assert!((k[0].thickness - a.pairs[0].thinnest).abs() < 1e-12 && (k[0].up_to - a.pairs[0].thickest).abs() < 1e-12, "{k:?}");
+        assert!(k[0].suggested_limit >= a.pairs[0].thickest, "{k:?}");
+    }
+
+    #[test]
+    fn a_wall_drafted_past_the_largest_draft_is_left_unpaired_and_says_so() {
+        // 15 degrees, 20 long: 2 to 7.4 thick, within the limit, but steeper than 10 degrees.
+        let body = wedge(20.0, 15.0);
+        let a = analyze(&body, &opts(10.0)).unwrap();
+        assert!(a.pairs.is_empty(), "{a:?}");
+        let steep: Vec<(f64, f64)> = a
+            .leftovers
+            .iter()
+            .filter_map(|l| match l.reason {
+                Reason::Steep { draft, gap } => Some((draft, gap)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steep.len(), 2, "{a:?}");
+        for (draft, gap) in steep {
+            assert!((draft - 15.0).abs() < 1e-9 && gap > 1.9 && gap < 2.1, "{draft} {gap}");
+        }
+        let c = completeness(&a, &confident(&a));
+        assert!(c.reported.iter().any(|(_, why)| why.contains("past the largest draft")), "{c:?}");
+        // Just under 10 degrees it pairs.
+        let a = analyze(&wedge(20.0, 9.5), &opts(10.0)).unwrap();
+        assert_eq!(a.pairs.len(), 1, "{a:?}");
+    }
+
+    #[test]
+    fn a_drafted_leg_joins_its_base_on_the_line_the_two_halfway_planes_meet_in() {
+        // An L bracket 20 deep: a base 2 thick (y = 0 to 2, x = 0 to 40) and a leg along x = 0
+        // whose inner face runs from (3, 2) up to (2, 30), drafted atan(1 / 28) against x = 0.
+        let pts = [Vec2::new(0.0, 0.0), Vec2::new(40.0, 0.0), Vec2::new(40.0, 2.0), Vec2::new(3.0, 2.0), Vec2::new(2.0, 30.0), Vec2::new(0.0, 30.0)];
+        let body = extrude(&Plane::XY, &[Region2 { outer: Loop2::polygon(&pts), holes: vec![] }], 0.0, 20.0).unwrap().pop().unwrap();
+        let a = analyze(&body, &opts(5.0)).unwrap();
+        assert_eq!(a.pairs.len(), 2, "{a:?}");
+        assert!(a.pairs.iter().all(|p| p.confidence == Confidence::High), "{a:?}");
+        let leg = a.pairs.iter().find(|p| p.draft > 0.0).unwrap();
+        let base = a.pairs.iter().find(|p| p.draft == 0.0).unwrap();
+        let d = (1.0_f64 / 28.0).atan();
+        assert!((leg.draft - d.to_degrees()).abs() < 1e-9, "{leg:?}");
+        // On the bisector the wall is twice the distance to x = 0 over cos(d / 2): 3 at the base's
+        // top corner (3, 2), 2 at the leg's inner tip (2, 30), whose ends bound the sheet.
+        assert!((leg.thickest - 3.0 / (d / 2.0).cos()).abs() < 1e-6, "{leg:?}");
+        assert!((leg.thinnest - 2.0 / (d / 2.0).cos()).abs() < 1e-6, "{leg:?}");
+        assert!((base.thickness - 2.0).abs() < 1e-9);
+        // The base's halfway plane y = 1 meets the leg's bisector, -x = (28 (x - 3) + (y - 2)) /
+        // sqrt 785, at x = 85 / (28 + sqrt 785). Both sheets reach that line.
+        let x = 85.0 / (28.0 + 785.0_f64.sqrt());
+        let s = sheets(&body, &a.pairs).unwrap();
+        assert_eq!(s.len(), 2, "{s:?}");
+        for sheet in &s {
+            assert!(sheet.corners.iter().any(|c| (c[0] - x).abs() < 1e-6 && (c[1] - 1.0).abs() < 1e-6), "{x}: {sheet:?}");
+            assert!(!sheet.notes.iter().any(|n| n.contains("was not made")), "{sheet:?}");
+        }
+        // The tip and the two ends are rims; every face is accounted for.
+        let c = completeness(&a, &a.pairs);
+        assert_eq!((c.paired.len(), c.rims.len(), c.reported.len()), (4, 4, 0), "{c:?}");
+    }
+
+    #[test]
+    fn a_frame_with_one_drafted_wall_joins_all_four_sheets_at_its_corners() {
+        // A frame 60 x 40, 3 thick, 20 deep, its top wall's inner face drafted from (57, 37) to
+        // (3, 37 - 54 tan 2 degrees): 3 thick at the right, about 4.9 at the left.
+        let t = 2.0_f64.to_radians().tan();
+        let outer = [Vec2::new(0.0, 0.0), Vec2::new(60.0, 0.0), Vec2::new(60.0, 40.0), Vec2::new(0.0, 40.0)];
+        let inner = [Vec2::new(3.0, 3.0), Vec2::new(3.0, 37.0 - 54.0 * t), Vec2::new(57.0, 37.0), Vec2::new(57.0, 3.0)];
+        let region = Region2 { outer: Loop2::polygon(&outer).ccw(), holes: vec![Loop2::polygon(&inner).ccw().reversed()] };
+        let body = extrude(&Plane::XY, &[region], 0.0, 20.0).unwrap().pop().unwrap();
+        let a = analyze(&body, &opts(6.0)).unwrap();
+        assert_eq!(a.pairs.len(), 4, "{a:?}");
+        assert_eq!(a.pairs.iter().filter(|p| p.draft > 0.0).count(), 1, "{a:?}");
+        assert!(a.pairs.iter().all(|p| p.confidence == Confidence::High), "{a:?}");
+        let s = sheets(&body, &a.pairs).unwrap();
+        assert_eq!(s.len(), 4, "{s:?}");
+        assert!(s.iter().all(|x| !x.notes.iter().any(|n| n.contains("was not made"))), "{s:?}");
+        // The top wall's bisector meets the side walls' halfway planes x = 1.5 and x = 58.5: the
+        // top sheet reaches both, and each side sheet reaches it there.
+        let top = s.iter().find(|x| x.notes.iter().any(|n| n.starts_with("a drafted wall"))).unwrap();
+        for side_x in [1.5, 58.5] {
+            let corner = top.corners.iter().find(|c| (c[0] - side_x).abs() < 1e-6).copied();
+            let Some(corner) = corner else { panic!("{side_x}: {top:?}") };
+            let side = s.iter().find(|x| x.corners.iter().all(|c| (c[0] - side_x).abs() < 1e-6)).unwrap();
+            assert!(side.corners.iter().any(|c| (c[1] - corner[1]).abs() < 1e-6), "{corner:?}: {side:?}");
+        }
+        assert!(surface_body(&s).is_ok());
     }
 }

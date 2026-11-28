@@ -16,7 +16,7 @@ fn reasons(a: &Analysis) -> String {
     for l in &a.leftovers {
         match l.reason {
             Reason::NotPlanar => planar += 1,
-            Reason::OutOfRange { .. } | Reason::TooThin { .. } | Reason::NoOverlap { .. } => range += 1,
+            Reason::OutOfRange { .. } | Reason::TooThin { .. } | Reason::NoOverlap { .. } | Reason::Steep { .. } => range += 1,
             Reason::NoFacingFace => none += 1,
             Reason::Rim { .. } => rim += 1,
         }
@@ -27,7 +27,7 @@ fn reasons(a: &Analysis) -> String {
         .collect();
     let c = completeness(a, &confident(a));
     format!(
-        "left over: {rim} rims, {planar} not plane/cylinder, {range} facing but out of range or not overlapping, {none} nothing facing; completeness {} paired + {} rims + {} reported = {}/{}; clusters [{}]",
+        "left over: {rim} rims, {planar} not plane/cylinder, {range} facing but out of range, not overlapping or too steep, {none} nothing facing; completeness {} paired + {} rims + {} reported = {}/{}; clusters [{}]",
         c.paired.len(),
         c.rims.len(),
         c.reported.len(),

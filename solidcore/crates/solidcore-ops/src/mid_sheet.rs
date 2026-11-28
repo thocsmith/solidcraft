@@ -28,6 +28,13 @@ pub enum Wall {
         /// The distance to the other face (positive).
         thickness: f64,
     },
+    /// The wedge behind both faces of a drafted wall (each outward normal points out of it).
+    Drafted {
+        /// The wall's first face.
+        first: OutwardPlane,
+        /// The wall's second face.
+        second: OutwardPlane,
+    },
     /// The shell between two radii about one axis.
     Round {
         /// A point on the axis.
@@ -86,6 +93,10 @@ pub fn wall_holds(wall: &Wall, points: &[[f64; 3]], slack: f64) -> Result<bool> 
         Wall::Flat { face, thickness } => KernelWall::Flat {
             face: plane(&face),
             thickness,
+        },
+        Wall::Drafted { first, second } => KernelWall::Drafted {
+            first: plane(&first),
+            second: plane(&second),
         },
         Wall::Round {
             axis_point,

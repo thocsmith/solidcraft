@@ -220,3 +220,32 @@ fn replies_match_the_output_schemas() {
         .unwrap_or_else(|e| panic!("{e}"));
     check(output_schema_for::<FeatureResult>(), &again);
 }
+
+/// A wall 3 thick, 30 wide and 40 tall, its face x = 3 drafted 2 degrees about the floor: the
+/// analysis pairs it as a drafted wall, says its draft and its thinnest and thickest in closed
+/// form, and the midsurface builds its sheet.
+#[test]
+fn a_drafted_wall_is_analysed_and_built_through_the_commands() {
+    let mut s = Session::default();
+    s.execute("solid.box", &json!({"length": 3, "width": 30, "height": 40, "body_name": "Wall"})).unwrap_or_else(|e| panic!("{e}"));
+    s.execute("solid.draft", &json!({"body": "Wall", "faces": [[3, 15, 20]], "angle": "2 deg", "neutral": "XY"})).unwrap_or_else(|e| panic!("{e}"));
+    let reply = s.execute("surface.midsurface_analyze", &json!({"body": "Wall", "max_thickness": "5 mm"})).unwrap_or_else(|e| panic!("{e}"));
+    let schema = output_schema_for::<MidsurfaceAnalysis>().as_value().clone();
+    assert!(conforms(&schema, &schema, &reply), "{reply}");
+    let pairs = reply.get("pairs").and_then(Value::as_array).unwrap_or_else(|| panic!("{reply}"));
+    let drafted: Vec<&Value> = pairs.iter().filter(|p| p.get("draft").and_then(Value::as_f64).is_some_and(|d| d > 0.0)).collect();
+    assert_eq!(drafted.len(), 1, "{reply}");
+    let p = drafted[0];
+    let num = |k: &str| p.get(k).and_then(Value::as_f64).unwrap_or_else(|| panic!("{k}: {p}"));
+    assert!((num("draft") - 2.0).abs() < 1e-6, "{p}");
+    // Along the bisector's normal, tilted 1 degree: the sheet's bottom end comes from the corner
+    // (0, 0) of the face x = 0, which stands 3 cos 2 degrees in front of the drafted face; its top
+    // end from the drafted face's top corner, 3 - 40 tan 2 degrees from x = 0.
+    let (d, half) = (2.0_f64.to_radians(), 1.0_f64.to_radians());
+    assert!((num("thickest") - 3.0 * d.cos() / half.cos()).abs() < 1e-6, "{p}");
+    assert!((num("thinnest") - (3.0 - 40.0 * d.tan()) / half.cos()).abs() < 1e-6, "{p}");
+    assert!(num("thinnest") < num("thickness") && num("thickness") < num("thickest"), "{p}");
+    assert_eq!(p.get("confidence").and_then(Value::as_str), Some("high"), "{p}");
+    let built = s.execute("surface.midsurface", &json!({"body": "Wall", "max_thickness": "5 mm"})).unwrap_or_else(|e| panic!("{e}"));
+    assert!(built.get("created_bodies").and_then(Value::as_array).is_some_and(|b| b.len() == 1), "{built}");
+}

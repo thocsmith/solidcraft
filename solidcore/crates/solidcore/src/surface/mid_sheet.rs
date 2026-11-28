@@ -5,8 +5,10 @@
 //! A wall is the material between two faces that face each other
 //! ([`face_pair`](crate::surface::face_pair) for planes,
 //! [`face_pair_cylinder`](crate::surface::face_pair_cylinder) for cylinders): a flat wall is the
-//! slab behind its first face, as thick as the pair is; a round wall is the shell between the two
-//! radii about the shared axis. A point lies in it when it is within `slack` of that slab or shell.
+//! slab behind its first face, as thick as the pair is; a drafted wall is the wedge behind both of
+//! its faces (two planes tilted apart, [`drafted_planes`](crate::surface::face_pair::drafted_planes));
+//! a round wall is the shell between the two radii about the shared axis. A point lies in it when
+//! it is within `slack` of that slab, wedge or shell.
 //!
 //! Not upstream: no counterpart in SMLib. Deviations: none. No recursion.
 
@@ -31,6 +33,14 @@ pub enum Wall {
         face: OutwardPlane,
         /// The distance to the other face (positive).
         thickness: f64,
+    },
+    /// A drafted wall: the wedge behind both faces (each face's outward normal points out of the
+    /// wall), two planes tilted apart.
+    Drafted {
+        /// The wall's first face.
+        first: OutwardPlane,
+        /// The wall's second face.
+        second: OutwardPlane,
     },
     /// A round wall: the shell between two radii about one axis.
     Round {
@@ -61,7 +71,8 @@ fn finite(v: Vec3) -> bool {
 }
 
 /// Whether every one of `points` lies in `wall`, within `slack`: no farther in front of the
-/// first face or behind the second than `slack` (flat), or no nearer the axis than the inner
+/// first face or behind the second than `slack` (flat), no farther in front of either face than
+/// `slack` (drafted), or no nearer the axis than the inner
 /// radius less `slack` nor farther than the outer radius and `slack` (round). True for no points.
 ///
 /// # Errors
@@ -95,6 +106,21 @@ pub fn wall_holds(wall: &Wall, points: &[Point3], slack: f64) -> Result<bool> {
             Ok(points.iter().all(|p| {
                 let depth = face.point.distance_along(*p, n);
                 depth >= -slack && depth <= thickness + slack
+            }))
+        }
+        Wall::Drafted { first, second } => {
+            if !(finite(first.point)
+                && finite(first.outward)
+                && finite(second.point)
+                && finite(second.outward))
+            {
+                return Err(bad("a drafted wall's faces must be finite"));
+            }
+            let (na, nb) = (first.outward.unitize()?, second.outward.unitize()?);
+            // How far in front of each face: negative behind it, in the wall.
+            Ok(points.iter().all(|p| {
+                p.distance_along(first.point, na) <= slack
+                    && p.distance_along(second.point, nb) <= slack
             }))
         }
         Wall::Round {
@@ -399,5 +425,46 @@ mod tests {
             ..frame
         };
         assert!(in_frame(&broken, v(0.0, 0.0, 0.0)).is_err());
+    }
+
+    #[test]
+    fn a_drafted_wall_holds_the_wedge_behind_both_faces() {
+        // The bottom z = 0 facing down, the top through (0, 0, 2) tilted 5 degrees about y.
+        let t = 5.0_f64.to_radians();
+        let wall = Wall::Drafted {
+            first: OutwardPlane {
+                point: v(0.0, 0.0, 2.0),
+                outward: v(-det::sin(t), 0.0, det::cos(t)),
+            },
+            second: OutwardPlane {
+                point: v(0.0, 0.0, 0.0),
+                outward: v(0.0, 0.0, -1.0),
+            },
+        };
+        // Inside, on either face, and 10 along x where the top has risen 10 tan 5 degrees.
+        let rise = 2.0 + 10.0 * det::tan(t);
+        let inside = [
+            v(0.0, 0.0, 1.0),
+            v(0.0, 5.0, 0.0),
+            v(10.0, 0.0, rise - 1e-9),
+        ];
+        assert!(wall_holds(&wall, &inside, 0.0).unwrap());
+        // Above the top, below the bottom, and past the line the faces meet in.
+        for p in [v(0.0, 0.0, 2.1), v(0.0, 0.0, -0.1), v(-30.0, 0.0, 0.0)] {
+            assert!(!wall_holds(&wall, &[p], 0.0).unwrap(), "{p:?}");
+        }
+        // The slack reaches a little out of the wall.
+        assert!(wall_holds(&wall, &[v(0.0, 0.0, -0.05)], 0.1).unwrap());
+        let bad = Wall::Drafted {
+            first: OutwardPlane {
+                point: v(0.0, 0.0, 0.0),
+                outward: v(0.0, 0.0, 0.0),
+            },
+            second: OutwardPlane {
+                point: v(0.0, 0.0, 0.0),
+                outward: v(0.0, 0.0, -1.0),
+            },
+        };
+        assert!(wall_holds(&bad, &[v(0.0, 0.0, 0.0)], 0.0).is_err());
     }
 }

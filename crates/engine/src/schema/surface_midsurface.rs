@@ -23,7 +23,8 @@ fn body<'de, D: Deserializer<'de>>(d: D) -> Result<String, D::Error> {
 }
 
 /// Make the mid-surfaces of a thin-walled solid: for each pair of faces that face each other
-/// across material (flat walls and round walls), the surface halfway between them, joined where
+/// across material (flat walls; drafted walls, two planes tilted apart by up to 10 degrees, whose
+/// surface is the plane bisecting them; and round walls), the surface halfway between them, joined where
 /// walls meet, holes through both faces carried. Without `pairs`, the pairs the analysis is sure
 /// of are built (see `surface.midsurface_analyze`); pairs that need a decision are left out unless
 /// `include_review_pairs`. The feature stores the pairs chosen, including a chosen round pair that
@@ -119,13 +120,24 @@ pub struct MidsurfacePair {
     pub faces: [usize; 2],
     /// A point inside each face: what `pairs` takes to build this pair.
     pub points: [[f64; 3]; 2],
-    /// The wall's thickness, mm.
+    /// The wall's thickness, mm. For a drafted wall, its mean over the sheet (what the sheet
+    /// carries); `thinnest` and `thickest` give its range.
     pub thickness: f64,
+    /// The wall's thinnest over the sheet, mm: `thickness` for a flat or round wall. The
+    /// thickness limits take a pair when its thinnest and thickest both lie within them.
+    pub thinnest: f64,
+    /// The wall's thickest over the sheet, mm: `thickness` for a flat or round wall. `aspect` is
+    /// read against it.
+    pub thickest: f64,
+    /// The angle between the two faces, degrees: 0 for a flat or round wall; more than 0.5 and at
+    /// most 10 for a drafted wall (two planes tilted apart, its sheet on the plane bisecting them).
+    pub draft: f64,
     /// The sheet's area before its joints are made, mm².
     pub area: f64,
     /// The share of the smaller face the other covers, 0 to 1.
     pub coverage: f64,
-    /// The square root of the area over the thickness: below `min_aspect`, not shell-like.
+    /// The square root of the area over the thickness (`thickest`): below `min_aspect`, not
+    /// shell-like.
     pub aspect: f64,
     /// `high` (built by default) or `review` (needs a decision: see `notes`).
     pub confidence: String,
@@ -146,11 +158,17 @@ pub struct MidsurfaceLeftover {
     /// `rim` (the thin end of a paired wall: accounted for), `not_plane_or_cylinder`,
     /// `out_of_range` (a face looks back, `gap` mm away, past `max_thickness`), `too_thin` (a face
     /// looks back nearer than `min_thickness`), `no_overlap` (a face looks back within the limits
-    /// but the two do not overlap), or `no_facing_face`.
+    /// but the two do not overlap), `too_steep` (a planar face looks back across material within
+    /// the limits, but the two lean `draft` degrees apart, past the 10 degrees a drafted wall may
+    /// have), or `no_facing_face`.
     pub reason: String,
-    /// For `out_of_range`, `too_thin` and `no_overlap`: how far away the facing face is, mm.
+    /// For `out_of_range`, `too_thin` and `no_overlap`: how far away the facing face is, mm. For
+    /// `too_steep`: the wall's thinnest, mm.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gap: Option<f64>,
+    /// For `too_steep`: the angle between the two faces, degrees.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub draft: Option<f64>,
     /// For `rim`: the pairs (indices into `pairs`) whose walls hold it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pairs: Vec<usize>,

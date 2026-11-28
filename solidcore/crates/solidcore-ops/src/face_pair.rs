@@ -2,10 +2,15 @@
 //! material, how far apart they are, and the plane halfway between them
 //! ([`solidcore::surface::face_pair::facing_planes`], at the kernel's angular and zone
 //! tolerances), the same for cylinders, and a cylindrical face's material side, the directions
-//! that stay on it, and one cylinder's axial range in another's coordinates. Ops converts the
-//! arrays; the kernel decides.
+//! that stay on it, and one cylinder's axial range in another's coordinates. Drafted planes (two
+//! sides of a wall tilted apart): their bisector and the wall's thickness at points of it
+//! ([`solidcore::surface::face_pair::drafted_planes`]), and a plane moved behind itself. Ops
+//! converts the arrays; the kernel decides.
 
-use solidcore::surface::face_pair::{facing_planes as kernel_facing_planes, OutwardPlane as Plane};
+use solidcore::surface::face_pair::{
+    drafted_planes as kernel_drafted_planes, drafted_thickness as kernel_drafted_thickness,
+    facing_planes as kernel_facing_planes, inset as kernel_inset, OutwardPlane as Plane,
+};
 use solidcore::surface::face_pair_cylinder::{
     axial_range_in as kernel_axial_range_in, facing_cylinders as kernel_facing_cylinders,
     material_toward_axis as kernel_material_toward_axis,
@@ -13,7 +18,7 @@ use solidcore::surface::face_pair_cylinder::{
 };
 use solidcore::Vec3;
 
-use crate::session::run;
+use crate::session::{run, Answer};
 use crate::Result;
 
 /// A planar face's plane: a point on it and the face's outward normal (any nonzero length).
@@ -59,6 +64,85 @@ pub fn facing_planes(a: &OutwardPlane, b: &OutwardPlane) -> Result<Option<Facing
                 toward_first: [f.toward_first.x, f.toward_first.y, f.toward_first.z],
             }),
         )
+    })
+}
+
+/// Two planes whose outward normals point apart, tilted past the kernel's angular tolerance: a
+/// drafted wall's two sides, and the plane halfway between them (their bisector).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DraftedPlanes {
+    /// The angle between the two planes, in degrees: more than the kernel's angular tolerance,
+    /// less than 90.
+    pub draft_degrees: f64,
+    /// The bisector: a point on it and its unit normal, toward the first plane's side.
+    pub bisector: OutwardPlane,
+    /// A frame in the bisector: `x` along the line the two planes meet in, `y` at right angles to
+    /// it in the bisector (both unit; `x` cross `y` is the bisector's normal).
+    pub x: [f64; 3],
+    /// See `x`.
+    pub y: [f64; 3],
+}
+
+impl Answer for OutwardPlane {}
+
+/// The bisector of the drafted planes `a` and `b`. `None` is an answer, not a failure: the
+/// planes are parallel within the kernel's angular tolerance ([`facing_planes`] pairs them), or
+/// their normals do not point apart. Whether material lies between them is read from
+/// [`drafted_thickness`] where the faces overlap.
+///
+/// # Errors
+/// The kernel's refusal ([`crate::Error::Status`]) of a point or normal that is not finite, or a
+/// normal of zero length.
+pub fn drafted_planes(a: &OutwardPlane, b: &OutwardPlane) -> Result<Option<DraftedPlanes>> {
+    run("face_pair::drafted_planes", |k| {
+        Ok(
+            kernel_drafted_planes(k, &plane(a), &plane(b))?.map(|d| DraftedPlanes {
+                draft_degrees: d.draft_degrees,
+                bisector: OutwardPlane {
+                    point: [d.bisector.point.x, d.bisector.point.y, d.bisector.point.z],
+                    outward: [
+                        d.bisector.outward.x,
+                        d.bisector.outward.y,
+                        d.bisector.outward.z,
+                    ],
+                },
+                x: [d.x.x, d.x.y, d.x.z],
+                y: [d.y.x, d.y.y, d.y.z],
+            }),
+        )
+    })
+}
+
+/// The drafted wall's thickness between `a` and `b` at each of `points`: along the bisector's
+/// normal through the point, positive behind both planes (in the wall), negative in front of
+/// both.
+///
+/// # Errors
+/// The kernel's refusal ([`crate::Error::Status`]) of a plane or point that is not finite, a
+/// normal of zero length, too many points, or planes that are not drafted.
+pub fn drafted_thickness(
+    a: &OutwardPlane,
+    b: &OutwardPlane,
+    points: &[[f64; 3]],
+) -> Result<Vec<f64>> {
+    let points: Vec<Vec3> = points.iter().copied().map(vec).collect();
+    run("face_pair::drafted_thickness", |k| {
+        kernel_drafted_thickness(k, &plane(a), &plane(b), &points)
+    })
+}
+
+/// `p` moved `by` behind itself, against its outward normal (which comes back unit length).
+///
+/// # Errors
+/// The kernel's refusal ([`crate::Error::Status`]) of a plane or distance that is not finite, or
+/// a normal of zero length.
+pub fn inset(p: &OutwardPlane, by: f64) -> Result<OutwardPlane> {
+    run("face_pair::inset", |_| {
+        let moved = kernel_inset(&plane(p), by)?;
+        Ok(OutwardPlane {
+            point: [moved.point.x, moved.point.y, moved.point.z],
+            outward: [moved.outward.x, moved.outward.y, moved.outward.z],
+        })
     })
 }
 
@@ -263,5 +347,28 @@ mod tests {
         assert_eq!(facing_planes(&low, &high).unwrap(), None);
         assert!(facing_planes(&low, &at([f64::NAN, 0.0, 0.0], [0.0, 0.0, -1.0])).is_err());
         assert!(facing_planes(&low, &at([0.0, 0.0, 0.0], [0.0, 0.0, 0.0])).is_err());
+    }
+
+    #[test]
+    fn a_drafted_wall_pairs_through_ops() {
+        // The bottom z = 0 facing down; the top through (0, 0, 2) facing up and back along x,
+        // tilted 4 degrees about y: (-sin 4, 0, cos 4), sin 4 = 0.0697564737441253,
+        // cos 4 = 0.9975640502598242 (literal: ops computes no geometry, not even in tests).
+        let (s4, c4) = (0.069_756_473_744_125_3, 0.997_564_050_259_824_2);
+        let top = at([0.0, 0.0, 2.0], [-s4, 0.0, c4]);
+        let bottom = at([0.0, 0.0, 0.0], [0.0, 0.0, -1.0]);
+        let d = drafted_planes(&top, &bottom).unwrap().unwrap();
+        assert!((d.draft_degrees - 4.0).abs() < 1e-9, "{d:?}");
+        // At the origin the bisector's normal chord meets the bottom at 0 and the top a little
+        // above 2: positive, about 2.
+        let t = drafted_thickness(&top, &bottom, &[[0.0, 0.0, 1.0]]).unwrap();
+        assert!(t[0] > 1.99 && t[0] < 2.01, "{t:?}");
+        assert!(drafted_thickness(&top, &bottom, &[[f64::NAN, 0.0, 0.0]]).is_err());
+        // Parallel: no draft, and no thickness to read.
+        let flat_top = at([0.0, 0.0, 2.0], [0.0, 0.0, 1.0]);
+        assert_eq!(drafted_planes(&flat_top, &bottom).unwrap(), None);
+        assert!(drafted_thickness(&flat_top, &bottom, &[[0.0, 0.0, 1.0]]).is_err());
+        let moved = inset(&at([0.0, 0.0, 2.0], [0.0, 0.0, 4.0]), 0.5).unwrap();
+        assert_eq!(moved, at([0.0, 0.0, 1.5], [0.0, 0.0, 1.0]));
     }
 }
